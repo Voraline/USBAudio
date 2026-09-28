@@ -2,4 +2,3 @@ build/
 android/.gradle/
 android/local.properties
 android/app/build/
-driver/USBAudioWinUsb.inf

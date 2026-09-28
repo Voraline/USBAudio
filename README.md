@@ -9,7 +9,6 @@ All audio and feedback data travels over the USB accessory bulk endpoints. The p
 - `windows/` contains the Windows WASAPI capture, Opus encoding, AOA negotiation, and WinUSB transport.
 - `android/` contains the accessory-mode Android app, JNI bridge, Opus decoder, jitter buffer, clock correction, and AAudio playback.
 - `shared/Protocol.h` defines the USB packet format and CRC.
-- `driver/` generates the WinUSB INF for the current phone interface and AOA interface IDs.
 - `.github/workflows/build.yml` builds the Windows executable and Android release APK on pushes and pull requests.
 
 ## Requirements
@@ -18,7 +17,7 @@ The Android phone must support USB accessory mode and run Android 9 (API 28) or 
 
 Windows needs Visual Studio 2022 C++ build tools, CMake 3.24 or later, and Git. Android builds need JDK 17, Gradle 8.9, Android SDK Platform 35, Android Build Tools 35.0.0, NDK 27.2.12479018, and CMake 3.22.1. Gradle and CMake fetch Opus v1.5.2 automatically.
 
-The Windows host also needs a WinUSB driver bound to the phone's current USB interface and the Android accessory interface. Windows does not expose arbitrary vendor USB control transfers to a desktop app without a suitable function driver. The PowerShell helper creates an INF with the project interface GUID and the detected phone ID. Run it from an elevated PowerShell terminal with the current phone hardware ID from Device Manager. The INF is unsigned; Windows installations enforcing signed driver packages require a trusted signed driver package for that interface. After installing the driver, reconnect the phone. This driver setup is required for hardware use and does not change the application build.
+The Windows host also needs a WinUSB driver bound to the phone's current USB interface and the Android accessory interface. Windows does not expose arbitrary vendor USB control transfers to a desktop app without a suitable function driver. Use [Zadig](https://zadig.akeo.ie/) to bind WinUSB to the phone interface while the phone is in normal USB mode, then bind WinUSB to the Android Open Accessory interface if Windows does not retain a usable WinUSB binding after the phone switches modes. Select the individual Android USB interface rather than replacing drivers for unrelated phone functions. The sender discovers the interface GUIDs registered by the installed driver, so no project INF or custom interface GUID is needed. This driver setup is required for hardware use and does not change the application build.
 
 ## Build the Windows app
 
@@ -31,13 +30,7 @@ cmake --build build/windows --config Release --parallel
 
 The executable is `build/windows/Release/UsbAudioSender.exe`.
 
-To create the WinUSB INF, find the phone's current hardware ID in Device Manager under the connected phone interface's **Details > Hardware Ids**, then run elevated PowerShell:
-
-```powershell
-.\driver\Install-AoaWinUsb.ps1 -PhoneHardwareId 'USB\VID_1234&PID_5678&MI_00'
-```
-
-Replace the example with the phone's actual ID. The current phone VID and PID are also used on the sender command line. With a phone in its normal USB mode, run:
+Find the phone's current vendor ID and product ID in Device Manager under the connected phone interface's **Details > Hardware Ids**. With the phone in normal USB mode, run:
 
 ```powershell
 .\build\windows\Release\UsbAudioSender.exe --vid 1234 --pid 5678

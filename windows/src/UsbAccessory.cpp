@@ -8,13 +8,13 @@
 #include <thread>
 #include <vector>
 
+#include <objbase.h>
 #include <setupapi.h>
 
 #include "Protocol.h"
 
 namespace
 {
-    constexpr GUID UsbAudioInterfaceGuid = { 0xA6D1C905, 0x76DA, 0x4DBB, { 0x8C, 0x82, 0x91, 0x61, 0x54, 0x86, 0xC8, 0xB5 } };
     constexpr std::uint16_t GoogleVendorId = 0x18D1;
     constexpr std::uint16_t AccessoryProductId = 0x2D00;
     constexpr std::uint16_t AccessoryAdbProductId = 0x2D01;
@@ -43,6 +43,99 @@ namespace
     bool IsTimeoutError(DWORD Error)
     {
         return Error == ERROR_SEM_TIMEOUT || Error == ERROR_TIMEOUT || Error == ERROR_OPERATION_ABORTED;
+    }
+
+    void AppendInterfaceGuids(HKEY RegistryKey, const wchar_t* ValueName, std::vector<GUID>& InterfaceGuids)
+    {
+        DWORD DataType = 0;
+        DWORD DataSize = 0;
+        if (RegQueryValueExW(RegistryKey, ValueName, nullptr, &DataType, nullptr, &DataSize) != ERROR_SUCCESS ||
+            (DataType != REG_SZ && DataType != REG_MULTI_SZ) || DataSize < sizeof(wchar_t))
+        {
+            return;
+        }
+
+        std::vector<wchar_t> Data(DataSize / sizeof(wchar_t) + 1, L'\0');
+        if (RegQueryValueExW(RegistryKey, ValueName, nullptr, &DataType, reinterpret_cast<LPBYTE>(Data.data()), &DataSize) != ERROR_SUCCESS)
+        {
+            return;
+        }
+
+        const std::size_t CharacterCount = DataSize / sizeof(wchar_t);
+        for (std::size_t Offset = 0; Offset < CharacterCount;)
+        {
+            if (Data[Offset] == L'\0')
+            {
+                ++Offset;
+                continue;
+            }
+
+            std::size_t End = Offset;
+            while (End < CharacterCount && Data[End] != L'\0')
+            {
+                ++End;
+            }
+
+            const std::wstring Value(Data.data() + Offset, End - Offset);
+            GUID InterfaceGuid{};
+            if (SUCCEEDED(CLSIDFromString(Value.c_str(), &InterfaceGuid)) &&
+                std::none_of(InterfaceGuids.begin(), InterfaceGuids.end(), [&InterfaceGuid](const GUID& ExistingGuid)
+                {
+                    return IsEqualGUID(ExistingGuid, InterfaceGuid) != FALSE;
+                }))
+            {
+                InterfaceGuids.push_back(InterfaceGuid);
+            }
+
+            Offset = End + 1;
+        }
+    }
+
+    std::vector<GUID> FindInterfaceGuids(std::uint16_t VendorId, std::uint16_t ProductId)
+    {
+        std::vector<GUID> InterfaceGuids;
+        HDEVINFO DeviceInfo = SetupDiGetClassDevsW(nullptr, L"USB", nullptr, DIGCF_ALLCLASSES | DIGCF_PRESENT);
+        if (DeviceInfo == INVALID_HANDLE_VALUE)
+        {
+            return InterfaceGuids;
+        }
+
+        for (DWORD Index = 0;; ++Index)
+        {
+            SP_DEVINFO_DATA DeviceData{};
+            DeviceData.cbSize = sizeof(DeviceData);
+            if (!SetupDiEnumDeviceInfo(DeviceInfo, Index, &DeviceData))
+            {
+                break;
+            }
+
+            DWORD RequiredSize = 0;
+            SetupDiGetDeviceInstanceIdW(DeviceInfo, &DeviceData, nullptr, 0, &RequiredSize);
+            if (RequiredSize == 0)
+            {
+                continue;
+            }
+
+            std::vector<wchar_t> InstanceId(RequiredSize + 1, L'\0');
+            if (!SetupDiGetDeviceInstanceIdW(DeviceInfo, &DeviceData, InstanceId.data(), static_cast<DWORD>(InstanceId.size()), nullptr) ||
+                !ContainsId(InstanceId.data(), VendorId, ProductId))
+            {
+                continue;
+            }
+
+            HKEY RegistryKey = SetupDiOpenDevRegKey(DeviceInfo, &DeviceData, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_QUERY_VALUE);
+            if (RegistryKey == INVALID_HANDLE_VALUE)
+            {
+                continue;
+            }
+
+            AppendInterfaceGuids(RegistryKey, L"DeviceInterfaceGUIDs", InterfaceGuids);
+            AppendInterfaceGuids(RegistryKey, L"DeviceInterfaceGUID", InterfaceGuids);
+            RegCloseKey(RegistryKey);
+        }
+
+        SetupDiDestroyDeviceInfoList(DeviceInfo);
+        return InterfaceGuids;
     }
 }
 
@@ -147,40 +240,52 @@ bool UsbAccessoryLink::WaitForAccessory(std::atomic<bool>& Running)
 
 bool UsbAccessoryLink::OpenMatchingDevice(std::uint16_t VendorId, std::uint16_t ProductId)
 {
-    HDEVINFO DeviceInfo = SetupDiGetClassDevsW(&UsbAudioInterfaceGuid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (DeviceInfo == INVALID_HANDLE_VALUE)
+    for (const GUID& InterfaceGuid : FindInterfaceGuids(VendorId, ProductId))
     {
-        return false;
-    }
-    bool Opened = false;
-    for (DWORD Index = 0; !Opened; ++Index)
-    {
-        SP_DEVICE_INTERFACE_DATA InterfaceData{};
-        InterfaceData.cbSize = sizeof(InterfaceData);
-        if (!SetupDiEnumDeviceInterfaces(DeviceInfo, nullptr, &UsbAudioInterfaceGuid, Index, &InterfaceData))
-        {
-            break;
-        }
-        DWORD RequiredSize = 0;
-        SetupDiGetDeviceInterfaceDetailW(DeviceInfo, &InterfaceData, nullptr, 0, &RequiredSize, nullptr);
-        if (RequiredSize == 0)
+        HDEVINFO DeviceInfo = SetupDiGetClassDevsW(&InterfaceGuid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        if (DeviceInfo == INVALID_HANDLE_VALUE)
         {
             continue;
         }
-        std::vector<std::uint8_t> DetailBuffer(RequiredSize);
-        auto* Detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(DetailBuffer.data());
-        Detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-        if (!SetupDiGetDeviceInterfaceDetailW(DeviceInfo, &InterfaceData, Detail, RequiredSize, nullptr, nullptr))
+
+        bool Opened = false;
+        for (DWORD Index = 0; !Opened; ++Index)
         {
-            continue;
+            SP_DEVICE_INTERFACE_DATA InterfaceData{};
+            InterfaceData.cbSize = sizeof(InterfaceData);
+            if (!SetupDiEnumDeviceInterfaces(DeviceInfo, nullptr, &InterfaceGuid, Index, &InterfaceData))
+            {
+                break;
+            }
+
+            DWORD RequiredSize = 0;
+            SetupDiGetDeviceInterfaceDetailW(DeviceInfo, &InterfaceData, nullptr, 0, &RequiredSize, nullptr);
+            if (RequiredSize == 0)
+            {
+                continue;
+            }
+
+            std::vector<std::uint8_t> DetailBuffer(RequiredSize);
+            auto* Detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(DetailBuffer.data());
+            Detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+            if (!SetupDiGetDeviceInterfaceDetailW(DeviceInfo, &InterfaceData, Detail, RequiredSize, nullptr, nullptr))
+            {
+                continue;
+            }
+
+            if (ContainsId(Detail->DevicePath, VendorId, ProductId))
+            {
+                Opened = OpenPath(Detail->DevicePath);
+            }
         }
-        if (ContainsId(Detail->DevicePath, VendorId, ProductId))
+
+        SetupDiDestroyDeviceInfoList(DeviceInfo);
+        if (Opened)
         {
-            Opened = OpenPath(Detail->DevicePath);
+            return true;
         }
     }
-    SetupDiDestroyDeviceInfoList(DeviceInfo);
-    return Opened;
+    return false;
 }
 
 bool UsbAccessoryLink::OpenPath(const std::wstring& DevicePath)
