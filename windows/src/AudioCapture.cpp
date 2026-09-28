@@ -11,7 +11,7 @@
 #include <avrt.h>
 #include <ksmedia.h>
 #include <mmdeviceapi.h>
-#include <opus/opus.h>
+#include <opus.h>
 #include <propidl.h>
 #include <windows.h>
 

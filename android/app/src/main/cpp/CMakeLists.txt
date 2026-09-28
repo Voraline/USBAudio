@@ -17,6 +17,6 @@ FetchContent_MakeAvailable(opus)
 
 add_library(usb_audio_native SHARED Receiver.cpp)
 target_compile_features(usb_audio_native PRIVATE cxx_std_20)
-target_include_directories(usb_audio_native PRIVATE ../../../../../shared "${opus_SOURCE_DIR}/include")
+target_include_directories(usb_audio_native PRIVATE ../../../../../shared)
 target_link_libraries(usb_audio_native PRIVATE opus aaudio log android)
 target_compile_options(usb_audio_native PRIVATE -O2 -Wall -Wextra -Werror=return-type)

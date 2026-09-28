@@ -22,7 +22,7 @@ add_executable(UsbAudioSender
 )
 
 target_compile_features(UsbAudioSender PRIVATE cxx_std_20)
-target_include_directories(UsbAudioSender PRIVATE shared windows/src "${opus_SOURCE_DIR}/include")
+target_include_directories(UsbAudioSender PRIVATE shared windows/src)
 target_link_libraries(UsbAudioSender PRIVATE opus ole32 uuid avrt setupapi winusb advapi32)
 target_compile_definitions(UsbAudioSender PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 if(MSVC)
