@@ -3,15 +3,15 @@
 #include <array>
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <cwctype>
-#include <iostream>
 #include <thread>
 #include <vector>
 
 #include <objbase.h>
 #include <setupapi.h>
 
-#include "Protocol.h"
+#include "AudioFormat.h"
 
 namespace
 {
@@ -148,7 +148,6 @@ bool UsbAccessoryLink::EnterAccessoryMode(std::uint16_t VendorId, std::uint16_t 
 {
     if (!OpenMatchingDevice(VendorId, ProductId))
     {
-        std::wcerr << L"Could not open the requested phone USB interface through WinUSB.\n";
         return false;
     }
 
@@ -156,16 +155,15 @@ bool UsbAccessoryLink::EnterAccessoryMode(std::uint16_t VendorId, std::uint16_t 
     Setup.RequestType = 0xC0;
     Setup.Request = 51;
     Setup.Length = sizeof(USHORT);
-    USHORT Protocol = 0;
+    USHORT AccessoryProtocolVersion = 0;
     ULONG Transferred = 0;
-    if (!WinUsb_ControlTransfer(InterfaceHandle, Setup, reinterpret_cast<PUCHAR>(&Protocol), sizeof(Protocol), &Transferred, nullptr) || Transferred < sizeof(Protocol) || Protocol < 1)
+    if (!WinUsb_ControlTransfer(InterfaceHandle, Setup, reinterpret_cast<PUCHAR>(&AccessoryProtocolVersion), sizeof(AccessoryProtocolVersion), &Transferred, nullptr) || Transferred < sizeof(AccessoryProtocolVersion) || AccessoryProtocolVersion < 1)
     {
-        std::wcerr << L"The selected USB device did not respond to the Android Open Accessory protocol request.\n";
         Close();
         return false;
     }
 
-    const std::array<std::wstring, 6> Strings = { L"OpenAI", L"USB Audio Stream", L"USB Opus Audio", L"1.0", L"https://github.com/", L"USBAudio" };
+    const std::array<std::wstring, 6> Strings = { L"OpenAI", L"USB Audio Stream", L"USB PCM Audio", L"", L"https://github.com/", L"USBAudio" };
     Setup = {};
     Setup.RequestType = 0x40;
     Setup.Request = 52;
@@ -187,7 +185,6 @@ bool UsbAccessoryLink::EnterAccessoryMode(std::uint16_t VendorId, std::uint16_t 
         Setup.Length = static_cast<USHORT>(Utf8.size());
         if (!WinUsb_ControlTransfer(InterfaceHandle, Setup, Utf8.data(), static_cast<USHORT>(Utf8.size()), &Transferred, nullptr))
         {
-            std::wcerr << L"Could not send the Android accessory identification string.\n";
             Close();
             return false;
         }
@@ -198,7 +195,6 @@ bool UsbAccessoryLink::EnterAccessoryMode(std::uint16_t VendorId, std::uint16_t 
     Setup.Request = 53;
     if (!WinUsb_ControlTransfer(InterfaceHandle, Setup, nullptr, 0, &Transferred, nullptr))
     {
-        std::wcerr << L"Could not start Android Open Accessory mode.\n";
         Close();
         return false;
     }
@@ -211,11 +207,10 @@ bool UsbAccessoryLink::TryOpenAccessory()
     const std::array<std::uint16_t, 2> ProductIds = { AccessoryProductId, AccessoryAdbProductId };
     for (const std::uint16_t ProductId : ProductIds)
     {
-        if (OpenMatchingDevice(GoogleVendorId, ProductId))
+        if (OpenMatchingDevice(GoogleVendorId, ProductId, 0))
         {
             if (SelectBulkPipes())
             {
-                std::wcout << L"USB accessory audio link is ready.\n";
                 return true;
             }
             Close();
@@ -224,23 +219,53 @@ bool UsbAccessoryLink::TryOpenAccessory()
     return false;
 }
 
-bool UsbAccessoryLink::WaitForAccessory(std::atomic<bool>& Running)
+bool UsbAccessoryLink::WaitForAccessory(std::atomic<bool>& Running, std::uint32_t TimeoutMilliseconds)
 {
-    std::wcout << L"Waiting for the phone to reconnect in USB accessory mode...\n";
-    while (Running.load(std::memory_order_acquire))
+    const auto Deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(TimeoutMilliseconds);
+    while (Running.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < Deadline)
     {
         if (TryOpenAccessory())
         {
             return true;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     return false;
 }
 
-bool UsbAccessoryLink::OpenMatchingDevice(std::uint16_t VendorId, std::uint16_t ProductId)
+bool UsbAccessoryLink::WaitForReceiver(std::atomic<bool>& Running, std::uint32_t TimeoutMilliseconds)
 {
-    for (const GUID& InterfaceGuid : FindInterfaceGuids(VendorId, ProductId))
+    if (InterfaceHandle == nullptr || InPipe == 0)
+    {
+        return false;
+    }
+    const auto Deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(TimeoutMilliseconds);
+    while (Running.load(std::memory_order_acquire) &&
+        (TimeoutMilliseconds == 0 || std::chrono::steady_clock::now() < Deadline))
+    {
+        UCHAR Ready = 0;
+        ULONG Transferred = 0;
+        if (WinUsb_ReadPipe(InterfaceHandle, InPipe, &Ready, static_cast<ULONG>(sizeof(Ready)), &Transferred, nullptr))
+        {
+            if (Transferred == sizeof(Ready) && Ready == UsbAudio::ReceiverReady)
+            {
+                return true;
+            }
+            continue;
+        }
+        const DWORD Error = GetLastError();
+        if (!IsTimeoutError(Error))
+        {
+            return false;
+        }
+    }
+    return false;
+}
+
+bool UsbAccessoryLink::OpenMatchingDevice(std::uint16_t VendorId, std::uint16_t ProductId, UCHAR RequiredInterfaceNumber)
+{
+    const std::vector<GUID> InterfaceGuids = FindInterfaceGuids(VendorId, ProductId);
+    for (const GUID& InterfaceGuid : InterfaceGuids)
     {
         HDEVINFO DeviceInfo = SetupDiGetClassDevsW(&InterfaceGuid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
         if (DeviceInfo == INVALID_HANDLE_VALUE)
@@ -275,7 +300,27 @@ bool UsbAccessoryLink::OpenMatchingDevice(std::uint16_t VendorId, std::uint16_t 
 
             if (ContainsId(Detail->DevicePath, VendorId, ProductId))
             {
-                Opened = OpenPath(Detail->DevicePath);
+                if (!OpenPath(Detail->DevicePath))
+                {
+                    continue;
+                }
+
+                if (RequiredInterfaceNumber != 0xFF)
+                {
+                    USB_INTERFACE_DESCRIPTOR Descriptor{};
+                    if (!WinUsb_QueryInterfaceSettings(InterfaceHandle, 0, &Descriptor))
+                    {
+                        Close();
+                        continue;
+                    }
+                    if (Descriptor.bInterfaceNumber != RequiredInterfaceNumber)
+                    {
+                        Close();
+                        continue;
+                    }
+                }
+
+                Opened = true;
             }
         }
 
@@ -304,7 +349,7 @@ bool UsbAccessoryLink::OpenPath(const std::wstring& DevicePath)
 bool UsbAccessoryLink::SelectBulkPipes()
 {
     USB_INTERFACE_DESCRIPTOR Descriptor{};
-    if (!WinUsb_QueryInterfaceSettings(InterfaceHandle, 0, &Descriptor))
+    if (!WinUsb_QueryInterfaceSettings(InterfaceHandle, 0, &Descriptor) || Descriptor.bInterfaceNumber != 0)
     {
         return false;
     }
@@ -317,13 +362,13 @@ bool UsbAccessoryLink::SelectBulkPipes()
         {
             continue;
         }
-        if ((Pipe.PipeId & 0x80) != 0)
+        if ((Pipe.PipeId & 0x80) == 0)
         {
-            InPipe = Pipe.PipeId;
+            OutPipe = Pipe.PipeId;
         }
         else
         {
-            OutPipe = Pipe.PipeId;
+            InPipe = Pipe.PipeId;
         }
     }
     if (OutPipe == 0 || InPipe == 0)
@@ -332,116 +377,82 @@ bool UsbAccessoryLink::SelectBulkPipes()
     }
     ULONG TimeoutMs = 350;
     WinUsb_SetPipePolicy(InterfaceHandle, InPipe, PIPE_TRANSFER_TIMEOUT, sizeof(TimeoutMs), &TimeoutMs);
-    WinUsb_SetPipePolicy(InterfaceHandle, OutPipe, PIPE_TRANSFER_TIMEOUT, sizeof(TimeoutMs), &TimeoutMs);
-    return true;
+    UCHAR AutoSuspend = FALSE;
+    WinUsb_SetPowerPolicy(InterfaceHandle, AUTO_SUSPEND, sizeof(AutoSuspend), &AutoSuspend);
+    if (WriteEvent == nullptr)
+    {
+        WriteEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    }
+    return WriteEvent != nullptr;
+}
+
+bool UsbAccessoryLink::CompletePendingWrite(DWORD TimeoutMilliseconds)
+{
+    if (!WritePending)
+    {
+        return true;
+    }
+    const DWORD WaitResult = WaitForSingleObject(WriteEvent, TimeoutMilliseconds);
+    if (WaitResult != WAIT_OBJECT_0)
+    {
+        WinUsb_AbortPipe(InterfaceHandle, OutPipe);
+        WritePending = false;
+        return false;
+    }
+    ULONG Transferred = 0;
+    const bool Overlapped = WinUsb_GetOverlappedResult(InterfaceHandle, &WriteOverlapped, &Transferred, FALSE) != FALSE;
+    WritePending = false;
+    return Overlapped && Transferred == PendingWriteSize;
 }
 
 bool UsbAccessoryLink::WriteBytes(const std::uint8_t* Data, std::size_t Size)
 {
-    std::size_t Offset = 0;
-    while (Offset < Size)
-    {
-        ULONG Transferred = 0;
-        const ULONG Requested = static_cast<ULONG>(Size - Offset);
-        if (!WinUsb_WritePipe(InterfaceHandle, OutPipe, const_cast<PUCHAR>(Data + Offset), Requested, &Transferred, nullptr) || Transferred == 0)
-        {
-            return false;
-        }
-        Offset += Transferred;
-    }
-    return true;
-}
-
-bool UsbAccessoryLink::WriteAudio(std::uint32_t Sequence, std::uint64_t TimestampNs, const std::uint8_t* Payload, std::uint16_t PayloadSize)
-{
-    if (InterfaceHandle == nullptr || PayloadSize > UsbAudio::MaxPayloadSize)
+    if (!CompletePendingWrite(PipeTimeoutMs))
     {
         return false;
     }
-    std::array<std::uint8_t, UsbAudio::HeaderSize> HeaderData{};
-    const UsbAudio::PacketHeader Header{ UsbAudio::AudioPacketType, Sequence, TimestampNs, PayloadSize, UsbAudio::Crc32(Payload, PayloadSize) };
-    UsbAudio::EncodeHeader(HeaderData.data(), Header);
-    return WriteBytes(HeaderData.data(), HeaderData.size()) && WriteBytes(Payload, PayloadSize);
-}
-
-bool UsbAccessoryLink::ReadFeedback(std::atomic<bool>& Running)
-{
-    std::array<std::uint8_t, 4096> Buffer{};
-    std::size_t Buffered = 0;
-    std::array<std::uint8_t, 512> ReadBuffer{};
-    while (Running.load(std::memory_order_acquire) && InterfaceHandle != nullptr)
+    if (Size > WriteBuffer.size())
     {
-        ULONG Transferred = 0;
-        if (!WinUsb_ReadPipe(InterfaceHandle, InPipe, ReadBuffer.data(), static_cast<ULONG>(ReadBuffer.size()), &Transferred, nullptr))
-        {
-            const DWORD Error = GetLastError();
-            if (IsTimeoutError(Error))
-            {
-                continue;
-            }
-            if (Running.load(std::memory_order_acquire))
-            {
-                std::wcerr << L"USB feedback endpoint disconnected.\n";
-            }
-            return false;
-        }
-        if (Transferred == 0)
-        {
-            continue;
-        }
-        if (Buffered + Transferred > Buffer.size())
-        {
-            Buffered = 0;
-        }
-        std::copy_n(ReadBuffer.data(), Transferred, Buffer.data() + Buffered);
-        Buffered += Transferred;
-        while (Buffered >= UsbAudio::HeaderSize)
-        {
-            UsbAudio::PacketHeader Header{};
-            if (!UsbAudio::DecodeHeader(Buffer.data(), Header))
-            {
-                std::move(Buffer.begin() + 1, Buffer.begin() + Buffered, Buffer.begin());
-                --Buffered;
-                continue;
-            }
-            const std::size_t PacketSize = UsbAudio::HeaderSize + Header.PayloadSize;
-            if (Buffered < PacketSize)
-            {
-                break;
-            }
-            const std::uint8_t* Payload = Buffer.data() + UsbAudio::HeaderSize;
-            if (Header.Type == UsbAudio::FeedbackPacketType && Header.PayloadSize == 16 && UsbAudio::Crc32(Payload, Header.PayloadSize) == Header.PayloadCrc)
-            {
-                const std::uint32_t QueueFrames = UsbAudio::ReadU32(Payload);
-                const std::uint32_t LastSequence = UsbAudio::ReadU32(Payload + 4);
-                const std::uint32_t Underruns = UsbAudio::ReadU32(Payload + 8);
-                static_cast<void>(LastSequence);
-                static_cast<void>(Underruns);
-                static_cast<void>(QueueFrames);
-            }
-            std::move(Buffer.begin() + PacketSize, Buffer.begin() + Buffered, Buffer.begin());
-            Buffered -= PacketSize;
-        }
+        return false;
     }
-    return !Running.load(std::memory_order_acquire);
+    std::memcpy(WriteBuffer.data(), Data, Size);
+    WriteOverlapped = {};
+    WriteOverlapped.hEvent = WriteEvent;
+    ULONG Transferred = 0;
+    const ULONG Requested = static_cast<ULONG>(Size);
+    if (WinUsb_WritePipe(InterfaceHandle, OutPipe, WriteBuffer.data(), Requested, &Transferred, &WriteOverlapped))
+    {
+        return true;
+    }
+    if (GetLastError() != ERROR_IO_PENDING)
+    {
+        return false;
+    }
+    WritePending = true;
+    PendingWriteSize = Requested;
+    return true;
 }
 
-bool UsbAccessoryLink::IsOpen() const
+bool UsbAccessoryLink::WriteAudio(const std::int16_t* Samples)
 {
-    return InterfaceHandle != nullptr;
+    if (InterfaceHandle == nullptr || Samples == nullptr)
+    {
+        return false;
+    }
+    return WriteBytes(reinterpret_cast<const std::uint8_t*>(Samples), UsbAudio::AudioFrameSamples * sizeof(*Samples));
 }
 
 void UsbAccessoryLink::CancelTransfers()
 {
     if (InterfaceHandle != nullptr)
     {
-        if (InPipe != 0)
-        {
-            WinUsb_AbortPipe(InterfaceHandle, InPipe);
-        }
         if (OutPipe != 0)
         {
             WinUsb_AbortPipe(InterfaceHandle, OutPipe);
+        }
+        if (InPipe != 0)
+        {
+            WinUsb_AbortPipe(InterfaceHandle, InPipe);
         }
     }
 }
@@ -451,13 +462,24 @@ void UsbAccessoryLink::Close()
     if (InterfaceHandle != nullptr)
     {
         CancelTransfers();
+        if (WritePending)
+        {
+            ULONG Transferred = 0;
+            WinUsb_GetOverlappedResult(InterfaceHandle, &WriteOverlapped, &Transferred, TRUE);
+        }
         WinUsb_Free(InterfaceHandle);
         InterfaceHandle = nullptr;
     }
+    WritePending = false;
     if (DeviceHandle != INVALID_HANDLE_VALUE)
     {
         CloseHandle(DeviceHandle);
         DeviceHandle = INVALID_HANDLE_VALUE;
+    }
+    if (WriteEvent != nullptr)
+    {
+        CloseHandle(WriteEvent);
+        WriteEvent = nullptr;
     }
     OutPipe = 0;
     InPipe = 0;

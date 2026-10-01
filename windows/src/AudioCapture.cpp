@@ -4,16 +4,17 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
-#include <stdexcept>
-#include <thread>
+#include <limits>
+
+#include <immintrin.h>
 
 #include <audioclient.h>
 #include <avrt.h>
 #include <ksmedia.h>
 #include <mmdeviceapi.h>
-#include <opus.h>
-#include <propidl.h>
 #include <windows.h>
+
+#include "LowLatencyRender.h"
 
 namespace
 {
@@ -28,7 +29,7 @@ namespace
         return static_cast<std::int16_t>(std::lrint(Clamped * 32767.0f));
     }
 
-    float ReadSample(const std::uint8_t* Data, const WAVEFORMATEX* Format, std::uint16_t Bits, bool IsFloat)
+    float ReadSample(const std::uint8_t* Data, std::uint16_t Bits, bool IsFloat)
     {
         if (IsFloat && Bits == 32)
         {
@@ -59,7 +60,6 @@ namespace
             std::memcpy(&Value, Data, sizeof(Value));
             return static_cast<float>(Value) / 2147483648.0f;
         }
-        static_cast<void>(Format);
         return 0.0f;
     }
 
@@ -77,28 +77,55 @@ namespace
         return false;
     }
 
-    std::uint16_t GetBitsPerSample(const WAVEFORMATEX* Format)
+    void DownmixMonoFloat32Stereo(const std::uint8_t* Bytes, UINT32 Frames, float* Mono)
     {
-        return Format->wBitsPerSample;
+        const __m256 Half = _mm256_set1_ps(0.5f);
+        const __m256 AbsMask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+        const __m256 InfinityMagnitude = _mm256_set1_ps(std::numeric_limits<float>::infinity());
+        UINT32 Frame = 0;
+        for (; Frame + 8 <= Frames; Frame += 8)
+        {
+            const float* Source = reinterpret_cast<const float*>(Bytes + static_cast<std::size_t>(Frame) * 8);
+            __m256 First = _mm256_loadu_ps(Source);
+            __m256 Second = _mm256_loadu_ps(Source + 8);
+            First = _mm256_and_ps(First, _mm256_cmp_ps(_mm256_and_ps(First, AbsMask), InfinityMagnitude, _CMP_LT_OQ));
+            Second = _mm256_and_ps(Second, _mm256_cmp_ps(_mm256_and_ps(Second, AbsMask), InfinityMagnitude, _CMP_LT_OQ));
+            const __m256 Sums = _mm256_hadd_ps(First, Second);
+            const __m256 Ordered = _mm256_castpd_ps(_mm256_permute4x64_pd(_mm256_castps_pd(Sums), 0xD8));
+            _mm256_storeu_ps(Mono + Frame, _mm256_mul_ps(Ordered, Half));
+        }
+        for (; Frame < Frames; ++Frame)
+        {
+            const std::uint8_t* FrameData = Bytes + static_cast<std::size_t>(Frame) * 8;
+            float Left = 0.0f;
+            float Right = 0.0f;
+            std::memcpy(&Left, FrameData, sizeof(Left));
+            std::memcpy(&Right, FrameData + sizeof(float), sizeof(Right));
+            Left = std::isfinite(Left) ? Left : 0.0f;
+            Right = std::isfinite(Right) ? Right : 0.0f;
+            Mono[Frame] = (Left + Right) * 0.5f;
+        }
     }
 
-    std::uint64_t GetTimestampNs()
+    void DownmixMonoScalar(const std::uint8_t* Bytes, UINT32 Frames, std::uint32_t BlockAlign, std::uint16_t Bits, bool IsFloat, std::uint16_t Channels, float* Mono)
     {
-        LARGE_INTEGER Counter{};
-        LARGE_INTEGER Frequency{};
-        QueryPerformanceCounter(&Counter);
-        QueryPerformanceFrequency(&Frequency);
-        return static_cast<std::uint64_t>((static_cast<long double>(Counter.QuadPart) * 1000000000.0L) / Frequency.QuadPart);
+        const std::size_t BytesPerSample = Bits / 8;
+        for (UINT32 Frame = 0; Frame < Frames; ++Frame)
+        {
+            const std::uint8_t* FrameData = Bytes + static_cast<std::size_t>(Frame) * BlockAlign;
+            const float Left = ReadSample(FrameData, Bits, IsFloat);
+            const float Right = Channels > 1 ? ReadSample(FrameData + BytesPerSample, Bits, IsFloat) : Left;
+            Mono[Frame] = (Left + Right) * 0.5f;
+        }
     }
 }
 
-bool AudioCapture::Run(std::atomic<bool>& Running, SpscQueue<AudioPacket, 17>& Queue, HANDLE QueueEventHandle)
+bool AudioCapture::Run(std::atomic<bool>& Running, SpscQueue<AudioPacket, AudioQueueCapacity>& Queue, HANDLE QueueEventHandle)
 {
     QueueEvent = QueueEventHandle;
     HRESULT Result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(Result) && Result != RPC_E_CHANGED_MODE)
     {
-        std::cerr << "Could not initialize the Windows audio capture thread.\n";
         return false;
     }
     const bool ShouldUninitialize = SUCCEEDED(Result);
@@ -109,20 +136,7 @@ bool AudioCapture::Run(std::atomic<bool>& Running, SpscQueue<AudioPacket, 17>& Q
     IAudioCaptureClient* Capture = nullptr;
     WAVEFORMATEX* MixFormat = nullptr;
     HANDLE AudioEvent = nullptr;
-    int OpusError = OPUS_OK;
-    Encoder = opus_encoder_create(UsbAudio::SampleRate, UsbAudio::Channels, OPUS_APPLICATION_AUDIO, &OpusError);
-    if (OpusError != OPUS_OK || Encoder == nullptr)
-    {
-        std::cerr << "Could not create the Opus encoder.\n";
-        if (ShouldUninitialize)
-        {
-            CoUninitialize();
-        }
-        return false;
-    }
-    opus_encoder_ctl(static_cast<OpusEncoder*>(Encoder), OPUS_SET_BITRATE(128000));
-    opus_encoder_ctl(static_cast<OpusEncoder*>(Encoder), OPUS_SET_COMPLEXITY(5));
-    opus_encoder_ctl(static_cast<OpusEncoder*>(Encoder), OPUS_SET_VBR(1));
+    LowLatencyRender LowLatency;
     DWORD TaskIndex = 0;
     HANDLE MmcssHandle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &TaskIndex);
     if (MmcssHandle != nullptr)
@@ -148,6 +162,7 @@ bool AudioCapture::Run(std::atomic<bool>& Running, SpscQueue<AudioPacket, 17>& Q
         {
             Device->Release();
         }
+        LowLatency.Close();
         if (Enumerator != nullptr)
         {
             Enumerator->Release();
@@ -159,11 +174,6 @@ bool AudioCapture::Run(std::atomic<bool>& Running, SpscQueue<AudioPacket, 17>& Q
         if (AudioEvent != nullptr)
         {
             CloseHandle(AudioEvent);
-        }
-        if (Encoder != nullptr)
-        {
-            opus_encoder_destroy(static_cast<OpusEncoder*>(Encoder));
-            Encoder = nullptr;
         }
         if (MmcssHandle != nullptr)
         {
@@ -181,47 +191,49 @@ bool AudioCapture::Run(std::atomic<bool>& Running, SpscQueue<AudioPacket, 17>& Q
         FAILED(Device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&Client))) ||
         FAILED(Client->GetMixFormat(&MixFormat)))
     {
-        std::cerr << "Could not open the default Windows playback device.\n";
         Release();
         return false;
     }
     if (MixFormat->nChannels == 0 || MixFormat->nSamplesPerSec == 0 || MixFormat->nBlockAlign == 0)
     {
-        std::cerr << "The default Windows playback format is not supported.\n";
         Release();
         return false;
     }
     const bool IsFloat = IsFloatFormat(MixFormat);
-    const std::uint16_t Bits = GetBitsPerSample(MixFormat);
+    const std::uint16_t Bits = MixFormat->wBitsPerSample;
     if ((!IsFloat && Bits != 16 && Bits != 24 && Bits != 32) || (IsFloat && Bits != 32))
     {
-        std::cerr << "The default playback format must use 16, 24, or 32-bit PCM or 32-bit float.\n";
         Release();
         return false;
     }
+    const bool UseAvx2Downmix = IsFloat && Bits == 32 && MixFormat->nChannels == 2 && MixFormat->nBlockAlign == 8;
 
+    std::wcout << (LowLatency.Open(Device, MixFormat) ? L"Capture mode: low latency\n" : L"Capture mode: default\n");
     AudioEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (AudioEvent == nullptr || FAILED(Client->Initialize(AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 1000000, 0, MixFormat, nullptr)) ||
+            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0, MixFormat, nullptr)) ||
         FAILED(Client->SetEventHandle(AudioEvent)) || FAILED(Client->GetService(IID_PPV_ARGS(&Capture))) || FAILED(Client->Start()))
     {
-        std::cerr << "Could not start Windows loopback capture.\n";
         Release();
         return false;
     }
 
-    std::cout << "Capturing system audio at " << MixFormat->nSamplesPerSec << " Hz from " << MixFormat->nChannels << " channels.\n";
-    HANDLE WaitHandles[] = { AudioEvent };
+    HANDLE WaitHandles[] = { AudioEvent, LowLatency.GetEvent() };
+    const DWORD WaitCount = WaitHandles[1] != nullptr ? 2 : 1;
     while (Running.load(std::memory_order_acquire))
     {
-        const DWORD WaitResult = WaitForMultipleObjects(1, WaitHandles, FALSE, 100);
+        const DWORD WaitResult = WaitForMultipleObjects(WaitCount, WaitHandles, FALSE, 100);
         if (WaitResult == WAIT_TIMEOUT)
         {
             continue;
         }
+        if (WaitResult == WAIT_OBJECT_0 + 1)
+        {
+            LowLatency.FillSilence();
+            continue;
+        }
         if (WaitResult != WAIT_OBJECT_0)
         {
-            std::cerr << "Windows audio capture wait failed.\n";
             Running.store(false, std::memory_order_release);
             break;
         }
@@ -234,32 +246,35 @@ bool AudioCapture::Run(std::atomic<bool>& Running, SpscQueue<AudioPacket, 17>& Q
             Result = Capture->GetBuffer(&Data, &Frames, &Flags, nullptr, nullptr);
             if (FAILED(Result))
             {
-                std::cerr << "Windows loopback capture stopped.\n";
                 Running.store(false, std::memory_order_release);
                 break;
             }
-            if ((Flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0)
+            const auto* Bytes = reinterpret_cast<const std::uint8_t*>(Data);
+            UINT32 FramesDone = 0;
+            while (FramesDone < Frames && Running.load(std::memory_order_relaxed))
             {
-                for (UINT32 Frame = 0; Frame < Frames; ++Frame)
+                const UINT32 ChunkFrames = std::min<UINT32>(Frames - FramesDone, static_cast<UINT32>(MonoScratch.size()));
+                if ((Flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0)
                 {
-                    const float Silent[2] = { 0.0f, 0.0f };
-                    ConvertFrame(Silent, MixFormat->nChannels, MixFormat->nSamplesPerSec, Running, Queue);
+                    std::fill_n(MonoScratch.begin(), ChunkFrames, 0.0f);
                 }
-            }
-            else
-            {
-                const auto* Bytes = reinterpret_cast<const std::uint8_t*>(Data);
-                const std::size_t BytesPerSample = Bits / 8;
-                for (UINT32 Frame = 0; Frame < Frames && Running.load(std::memory_order_relaxed); ++Frame)
+                else
                 {
-                    const std::uint8_t* FrameData = Bytes + static_cast<std::size_t>(Frame) * MixFormat->nBlockAlign;
-                    const float Left = ReadSample(FrameData, MixFormat, Bits, IsFloat);
-                    const float Right = MixFormat->nChannels > 1
-                        ? ReadSample(FrameData + BytesPerSample, MixFormat, Bits, IsFloat)
-                        : Left;
-                    const float Stereo[2] = { Left, Right };
-                    ConvertFrame(Stereo, 2, MixFormat->nSamplesPerSec, Running, Queue);
+                    const std::uint8_t* ChunkBytes = Bytes + static_cast<std::size_t>(FramesDone) * MixFormat->nBlockAlign;
+                    if (UseAvx2Downmix)
+                    {
+                        DownmixMonoFloat32Stereo(ChunkBytes, ChunkFrames, MonoScratch.data());
+                    }
+                    else
+                    {
+                        DownmixMonoScalar(ChunkBytes, ChunkFrames, MixFormat->nBlockAlign, Bits, IsFloat, MixFormat->nChannels, MonoScratch.data());
+                    }
                 }
+                for (UINT32 Frame = 0; Frame < ChunkFrames && Running.load(std::memory_order_relaxed); ++Frame)
+                {
+                    ConvertFrame(MonoScratch[Frame], MixFormat->nSamplesPerSec, Running, Queue);
+                }
+                FramesDone += ChunkFrames;
             }
             Capture->ReleaseBuffer(Frames);
             if (!Running.load(std::memory_order_acquire))
@@ -272,18 +287,23 @@ bool AudioCapture::Run(std::atomic<bool>& Running, SpscQueue<AudioPacket, 17>& Q
     return true;
 }
 
-void AudioCapture::ConvertFrame(const float* Samples, std::uint32_t ChannelCount, std::uint32_t SourceRate, std::atomic<bool>& Running, SpscQueue<AudioPacket, 17>& Queue)
+void AudioCapture::ConvertFrame(float Mono, std::uint32_t SourceRate, std::atomic<bool>& Running, SpscQueue<AudioPacket, AudioQueueCapacity>& Queue)
 {
-    const float Left = Samples[0];
-    const float Right = ChannelCount > 1 ? Samples[1] : Left;
+    if (SourceRate == UsbAudio::SampleRate)
+    {
+        PcmFrame[PcmFramePosition] = ToPcm16(Mono);
+        if (++PcmFramePosition == UsbAudio::AudioFrameSamples)
+        {
+            EmitFrame(Queue);
+        }
+        return;
+    }
     const double Step = static_cast<double>(SourceRate) / UsbAudio::SampleRate;
     if (!HasPrevious)
     {
-        PreviousLeft = Left;
-        PreviousRight = Right;
+        PreviousSample = Mono;
         HasPrevious = true;
-        PcmFrame[PcmFramePosition * 2] = ToPcm16(Left);
-        PcmFrame[PcmFramePosition * 2 + 1] = ToPcm16(Right);
+        PcmFrame[PcmFramePosition] = ToPcm16(Mono);
         ++PcmFramePosition;
         ResamplePhase = Step;
     }
@@ -292,45 +312,23 @@ void AudioCapture::ConvertFrame(const float* Samples, std::uint32_t ChannelCount
         while (ResamplePhase <= 1.0 && Running.load(std::memory_order_relaxed))
         {
             const float Ratio = static_cast<float>(std::clamp(ResamplePhase, 0.0, 1.0));
-            PcmFrame[PcmFramePosition * 2] = ToPcm16(PreviousLeft + (Left - PreviousLeft) * Ratio);
-            PcmFrame[PcmFramePosition * 2 + 1] = ToPcm16(PreviousRight + (Right - PreviousRight) * Ratio);
+            PcmFrame[PcmFramePosition] = ToPcm16(PreviousSample + (Mono - PreviousSample) * Ratio);
             ++PcmFramePosition;
             if (PcmFramePosition == UsbAudio::AudioFrameSamples)
             {
-                EmitFrame(Running, Queue);
+                EmitFrame(Queue);
             }
             ResamplePhase += Step;
         }
         ResamplePhase -= 1.0;
-        PreviousLeft = Left;
-        PreviousRight = Right;
+        PreviousSample = Mono;
     }
 }
 
-void AudioCapture::EmitFrame(std::atomic<bool>& Running, SpscQueue<AudioPacket, 17>& Queue)
+void AudioCapture::EmitFrame(SpscQueue<AudioPacket, AudioQueueCapacity>& Queue)
 {
-    CurrentPacket.Sequence = Sequence++;
-    CurrentPacket.TimestampNs = GetTimestampNs();
-    const int EncodedSize = opus_encode(static_cast<OpusEncoder*>(Encoder), PcmFrame.data(),
-        static_cast<int>(UsbAudio::AudioFrameSamples), CurrentPacket.Payload.data(),
-        static_cast<opus_int32>(CurrentPacket.Payload.size()));
     PcmFramePosition = 0;
-    if (EncodedSize < 0)
-    {
-        std::cerr << "Opus encoding failed with error " << EncodedSize << ".\n";
-        Running.store(false, std::memory_order_release);
-        return;
-    }
-    CurrentPacket.PayloadSize = static_cast<std::uint16_t>(EncodedSize);
-    if (!Queue.Push(CurrentPacket))
-    {
-        static std::atomic<std::uint32_t> DroppedPackets{0};
-        if ((DroppedPackets.fetch_add(1, std::memory_order_relaxed) % 100) == 0)
-        {
-            std::cerr << "USB sender is behind; dropping captured audio packets.\n";
-        }
-    }
-    else if (QueueEvent != nullptr)
+    if (Queue.Push(PcmFrame) && QueueEvent != nullptr)
     {
         SetEvent(QueueEvent);
     }

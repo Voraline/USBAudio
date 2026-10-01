@@ -5,8 +5,10 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <windows.h>
+#include <avrt.h>
 
 #include "AudioCapture.h"
 #include "UsbAccessory.h"
@@ -15,6 +17,7 @@ namespace
 {
     std::atomic<bool> AppRunning{true};
     std::atomic<bool> SessionRunning{false};
+    constexpr std::chrono::milliseconds CandidateProbeInterval{250};
 
     BOOL WINAPI ConsoleControl(DWORD ControlType)
     {
@@ -25,6 +28,16 @@ namespace
             return TRUE;
         }
         return FALSE;
+    }
+
+    void ConfigureProcessScheduling()
+    {
+        SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+        PROCESS_POWER_THROTTLING_STATE Throttling{};
+        Throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        Throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+        Throttling.StateMask = 0;
+        SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &Throttling, sizeof(Throttling));
     }
 
     bool ParseId(const std::wstring& Value, std::uint16_t& Result)
@@ -38,35 +51,90 @@ namespace
         Result = static_cast<std::uint16_t>(Parsed);
         return true;
     }
+
+    bool TryConnectCandidate(UsbAccessoryLink& Link, std::atomic<bool>& Running, std::uint16_t VendorId, std::uint16_t ProductId, std::uint32_t TimeoutMilliseconds)
+    {
+        const auto Deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(TimeoutMilliseconds);
+        while (Running.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < Deadline)
+        {
+            if (Link.TryOpenAccessory())
+            {
+                const auto Remaining = std::chrono::duration_cast<std::chrono::milliseconds>(Deadline - std::chrono::steady_clock::now()).count();
+                return Remaining > 0 && Link.WaitForReceiver(Running, static_cast<std::uint32_t>(Remaining));
+            }
+            if (Link.EnterAccessoryMode(VendorId, ProductId))
+            {
+                const auto Remaining = std::chrono::duration_cast<std::chrono::milliseconds>(Deadline - std::chrono::steady_clock::now()).count();
+                if (Remaining <= 0 || !Link.WaitForAccessory(Running, static_cast<std::uint32_t>(Remaining)))
+                {
+                    return false;
+                }
+                const auto ReceiverRemaining = std::chrono::duration_cast<std::chrono::milliseconds>(Deadline - std::chrono::steady_clock::now()).count();
+                return ReceiverRemaining > 0 && Link.WaitForReceiver(Running, static_cast<std::uint32_t>(ReceiverRemaining));
+            }
+            std::this_thread::sleep_for(CandidateProbeInterval);
+        }
+        return false;
+    }
 }
 
 int wmain(int ArgumentCount, wchar_t** Arguments)
 {
     SetConsoleCtrlHandler(ConsoleControl, TRUE);
-    std::uint16_t VendorId = 0;
-    std::uint16_t ProductId = 0;
-    bool HasVendorId = false;
-    bool HasProductId = false;
+    ConfigureProcessScheduling();
+    std::vector<std::uint16_t> VendorIds;
+    std::vector<std::uint16_t> ProductIds;
+    std::uint32_t CandidateTimeoutMilliseconds = 5000;
     for (int ArgumentIndex = 1; ArgumentIndex < ArgumentCount; ++ArgumentIndex)
     {
-        const std::wstring Argument = Arguments[ArgumentIndex];
-        if (Argument == L"--vid" && ArgumentIndex + 1 < ArgumentCount)
+        const std::wstring Option = Arguments[ArgumentIndex];
+        if (Option == L"--timeout" && ArgumentIndex + 1 < ArgumentCount)
         {
-            HasVendorId = ParseId(Arguments[++ArgumentIndex], VendorId);
+            wchar_t* End = nullptr;
+            const unsigned long TimeoutSeconds = std::wcstoul(Arguments[++ArgumentIndex], &End, 10);
+            if (End == nullptr || *End != L'\0' || TimeoutSeconds == 0 || TimeoutSeconds > 300)
+            {
+                return 2;
+            }
+            CandidateTimeoutMilliseconds = static_cast<std::uint32_t>(TimeoutSeconds * 1000);
+            continue;
         }
-        else if (Argument == L"--pid" && ArgumentIndex + 1 < ArgumentCount)
+        std::vector<std::uint16_t>* Values = nullptr;
+        if (Option == L"--vid")
         {
-            HasProductId = ParseId(Arguments[++ArgumentIndex], ProductId);
+            Values = &VendorIds;
+        }
+        else if (Option == L"--pid")
+        {
+            Values = &ProductIds;
         }
         else
         {
-            std::wcerr << L"Usage: UsbAudioSender.exe [--vid XXXX --pid YYYY]\n";
+            return 2;
+        }
+
+        while (ArgumentIndex + 1 < ArgumentCount)
+        {
+            const std::wstring Value = Arguments[ArgumentIndex + 1];
+            if (Value.rfind(L"--", 0) == 0)
+            {
+                break;
+            }
+            std::uint16_t Id = 0;
+            if (!ParseId(Value, Id))
+            {
+                return 2;
+            }
+            Values->push_back(Id);
+            ++ArgumentIndex;
+        }
+        if (Values->empty())
+        {
             return 2;
         }
     }
-    if (HasVendorId != HasProductId)
+    if (VendorIds.size() != ProductIds.size())
     {
-        std::wcerr << L"Supply both --vid and --pid, or neither when the phone is already in accessory mode.\n";
         return 2;
     }
 
@@ -74,27 +142,32 @@ int wmain(int ArgumentCount, wchar_t** Arguments)
     {
         UsbAccessoryLink Link;
         bool Connected = Link.TryOpenAccessory();
-        if (!Connected && !HasVendorId)
+        if (Connected)
         {
-            std::wcerr << L"Phone is not in accessory mode. Start the app with its current phone --vid and --pid to enable USB negotiation and automatic reconnect.\n";
+            Connected = Link.WaitForReceiver(AppRunning);
+        }
+        else if (VendorIds.empty())
+        {
             return 1;
         }
-        if (!Connected && Link.EnterAccessoryMode(VendorId, ProductId))
+        for (std::size_t CandidateIndex = 0; !Connected && CandidateIndex < VendorIds.size() && AppRunning.load(std::memory_order_acquire); ++CandidateIndex)
         {
-            Connected = Link.WaitForAccessory(AppRunning);
+            Connected = TryConnectCandidate(Link, AppRunning, VendorIds[CandidateIndex], ProductIds[CandidateIndex], CandidateTimeoutMilliseconds);
         }
         if (!Connected)
         {
+            Link.Close();
             if (!AppRunning.load(std::memory_order_acquire))
             {
                 break;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
             continue;
         }
 
+        std::wcout << L"USB connected.\n";
         SessionRunning.store(true, std::memory_order_release);
-        SpscQueue<AudioPacket, 17> Queue;
+        SpscQueue<AudioPacket, AudioQueueCapacity> Queue;
         HANDLE QueueEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (QueueEvent == nullptr)
         {
@@ -104,35 +177,37 @@ int wmain(int ArgumentCount, wchar_t** Arguments)
         }
         std::thread Sender([&]()
         {
+            DWORD TaskIndex = 0;
+            HANDLE MmcssHandle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &TaskIndex);
+            if (MmcssHandle != nullptr)
+            {
+                AvSetMmThreadPriority(MmcssHandle, AVRT_PRIORITY_HIGH);
+            }
+            else
+            {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+            }
             AudioPacket Packet;
             while (SessionRunning.load(std::memory_order_acquire))
             {
                 if (Queue.Pop(Packet))
                 {
-                    if (!Link.WriteAudio(Packet.Sequence, Packet.TimestampNs, Packet.Payload.data(), Packet.PayloadSize))
+                    if (!Link.WriteAudio(Packet.data()))
                     {
-                        if (SessionRunning.load(std::memory_order_acquire))
-                        {
-                            std::wcerr << L"USB audio write failed. Waiting for a reconnect.\n";
-                        }
                         SessionRunning.store(false, std::memory_order_release);
                         break;
                     }
                 }
                 else
                 {
-                    WaitForSingleObject(QueueEvent, 1000);
+                    WaitForSingleObject(QueueEvent, INFINITE);
                 }
             }
-        });
-        std::thread Feedback([&]()
-        {
-            if (!Link.ReadFeedback(SessionRunning) && SessionRunning.load(std::memory_order_acquire))
+            if (MmcssHandle != nullptr)
             {
-                SessionRunning.store(false, std::memory_order_release);
+                AvRevertMmThreadCharacteristics(MmcssHandle);
             }
         });
-
         AudioCapture Capture;
         const bool CaptureStarted = Capture.Run(SessionRunning, Queue, QueueEvent);
         SessionRunning.store(false, std::memory_order_release);
@@ -142,19 +217,11 @@ int wmain(int ArgumentCount, wchar_t** Arguments)
         {
             Sender.join();
         }
-        if (Feedback.joinable())
-        {
-            Feedback.join();
-        }
         Link.Close();
         CloseHandle(QueueEvent);
         if (!CaptureStarted)
         {
             return 1;
-        }
-        if (AppRunning.load(std::memory_order_acquire))
-        {
-            std::wcout << L"Waiting for the USB audio connection to return...\n";
         }
     }
     return 0;

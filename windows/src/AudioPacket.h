@@ -5,24 +5,22 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "Protocol.h"
+#include "AudioFormat.h"
 
-struct AudioPacket
-{
-    std::uint32_t Sequence = 0;
-    std::uint64_t TimestampNs = 0;
-    std::uint16_t PayloadSize = 0;
-    std::array<std::uint8_t, UsbAudio::MaxPayloadSize> Payload{};
-};
+inline constexpr std::size_t AudioQueueCapacity = 32;
+
+using AudioPacket = std::array<std::int16_t, UsbAudio::AudioFrameSamples>;
 
 template <typename T, std::size_t Capacity>
 class SpscQueue
 {
 public:
+    static_assert(Capacity > 1 && (Capacity & (Capacity - 1)) == 0);
+
     bool Push(const T& Value)
     {
         const std::size_t Write = WriteIndex.load(std::memory_order_relaxed);
-        const std::size_t Next = (Write + 1) % Capacity;
+        const std::size_t Next = (Write + 1) & (Capacity - 1);
         if (Next == ReadIndex.load(std::memory_order_acquire))
         {
             return false;
@@ -40,12 +38,12 @@ public:
             return false;
         }
         Value = Items[Read];
-        ReadIndex.store((Read + 1) % Capacity, std::memory_order_release);
+        ReadIndex.store((Read + 1) & (Capacity - 1), std::memory_order_release);
         return true;
     }
 
 private:
     std::array<T, Capacity> Items{};
-    std::atomic<std::size_t> WriteIndex{0};
-    std::atomic<std::size_t> ReadIndex{0};
+    alignas(64) std::atomic<std::size_t> WriteIndex{0};
+    alignas(64) std::atomic<std::size_t> ReadIndex{0};
 };
