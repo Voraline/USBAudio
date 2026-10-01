@@ -67,7 +67,7 @@ private:
 class PcmRing
 {
 public:
-    static constexpr std::uint64_t CapacityFrames = 1024;
+    static constexpr std::uint64_t CapacityFrames = 2048;
 
     bool Write(const std::int16_t* Samples, std::size_t Frames)
     {
