@@ -7,7 +7,7 @@
 
 #include "AudioFormat.h"
 
-inline constexpr std::size_t AudioQueueCapacity = 32;
+inline constexpr std::size_t AudioQueueCapacity = 16;
 
 using AudioPacket = std::array<std::int16_t, UsbAudio::AudioFrameSamples>;
 
