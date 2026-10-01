@@ -18,7 +18,6 @@
 #include <jni.h>
 
 #include "AudioFormat.h"
-#include "DriftReader.h"
 
 class PerformanceHint
 {
@@ -219,7 +218,48 @@ private:
 
     void Render(std::int16_t* Output, std::int32_t NumFrames)
     {
-        Reader.Render(Output, NumFrames);
+        const std::uint64_t WriteFrame = Ring.GetWriteIndex();
+        std::uint64_t ReadFrame = Ring.GetReadIndex();
+        if (!PlaybackStarted)
+        {
+            if (WriteFrame - ReadFrame < StartupFrames)
+            {
+                std::memset(Output, 0, static_cast<std::size_t>(NumFrames) * sizeof(*Output));
+                return;
+            }
+            PlaybackStarted = true;
+        }
+        const std::uint64_t CallbackFrames = static_cast<std::uint64_t>(NumFrames);
+        std::uint64_t StaleFrame = ReadFrame;
+        std::int32_t FadeFrames = 0;
+        if (WriteFrame - ReadFrame > CallbackFrames + TrimHighWaterFrames)
+        {
+            ReadFrame = WriteFrame - (CallbackFrames + TrimTargetFrames);
+            FadeFrames = std::min<std::int32_t>(NumFrames, TrimFadeFrames);
+        }
+        for (std::int32_t Frame = 0; Frame < NumFrames; ++Frame)
+        {
+            const std::int32_t Current = TakeSample(ReadFrame, WriteFrame);
+            if (Frame < FadeFrames)
+            {
+                const std::int32_t Stale = TakeSample(StaleFrame, WriteFrame);
+                Output[Frame] = static_cast<std::int16_t>((Stale * (FadeFrames - Frame) + Current * Frame) / FadeFrames);
+            }
+            else
+            {
+                Output[Frame] = static_cast<std::int16_t>(Current);
+            }
+        }
+        Ring.PublishReadIndex(ReadFrame);
+    }
+
+    std::int16_t TakeSample(std::uint64_t& Frame, std::uint64_t WriteFrame) const
+    {
+        if (Frame >= WriteFrame)
+        {
+            return 0;
+        }
+        return Ring.GetSample(Frame++);
     }
 
     bool WaitFor(short Events)
@@ -358,13 +398,18 @@ private:
     static constexpr std::int64_t TransportTargetWorkNanos = 300000;
     static constexpr std::uint32_t TransportReportIntervalPackets = 8;
     static constexpr std::uint64_t StartupFrames = 240;
+    static constexpr std::uint64_t TrimTargetFrames = StartupFrames;
+    static constexpr std::uint64_t TrimHighWaterFrames = 480;
+    static constexpr std::int32_t TrimFadeFrames = 48;
+    static_assert(TrimHighWaterFrames + TrimFadeFrames < PcmRing::CapacityFrames);
+    static_assert(TrimTargetFrames < TrimHighWaterFrames);
     int Descriptor = -1;
     AAudioStream* Stream = nullptr;
     PcmRing Ring;
-    DriftReader<PcmRing> Reader{Ring, StartupFrames};
     std::atomic<bool> Running{false};
     std::thread TransportThread;
     std::thread ReadinessThread;
+    bool PlaybackStarted = false;
 };
 
 std::mutex ReceiverMutex;
