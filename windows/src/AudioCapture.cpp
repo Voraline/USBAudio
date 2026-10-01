@@ -249,6 +249,10 @@ bool AudioCapture::Run(std::atomic<bool>& Running, SpscQueue<AudioPacket, AudioQ
                 Running.store(false, std::memory_order_release);
                 break;
             }
+            if ((Flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0)
+            {
+                std::wcout << L"Capture discontinuity reported by Windows\n";
+            }
             const auto* Bytes = reinterpret_cast<const std::uint8_t*>(Data);
             UINT32 FramesDone = 0;
             while (FramesDone < Frames && Running.load(std::memory_order_relaxed))
@@ -328,7 +332,11 @@ void AudioCapture::ConvertFrame(float Mono, std::uint32_t SourceRate, std::atomi
 void AudioCapture::EmitFrame(SpscQueue<AudioPacket, AudioQueueCapacity>& Queue)
 {
     PcmFramePosition = 0;
-    if (Queue.Push(PcmFrame) && QueueEvent != nullptr)
+    if (!Queue.Push(PcmFrame))
+    {
+        std::wcout << L"Packet dropped: sender queue full\n";
+    }
+    else if (QueueEvent != nullptr)
     {
         SetEvent(QueueEvent);
     }
