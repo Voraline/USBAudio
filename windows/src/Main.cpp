@@ -18,6 +18,8 @@ namespace
     std::atomic<bool> AppRunning{true};
     std::atomic<bool> SessionRunning{false};
     constexpr std::chrono::milliseconds CandidateProbeInterval{250};
+    constexpr std::chrono::milliseconds CaptureRetryInterval{500};
+    constexpr std::uint32_t CaptureRetryLimit = 10;
 
     BOOL WINAPI ConsoleControl(DWORD ControlType)
     {
@@ -192,7 +194,7 @@ int wmain(int ArgumentCount, wchar_t** Arguments)
             {
                 if (Queue.Pop(Packet))
                 {
-                    if (!Link.WriteAudio(Packet.data()))
+                    if (!Link.WriteAudio(Packet.Samples.data(), Packet.Count))
                     {
                         SessionRunning.store(false, std::memory_order_release);
                         break;
@@ -208,8 +210,28 @@ int wmain(int ArgumentCount, wchar_t** Arguments)
                 AvRevertMmThreadCharacteristics(MmcssHandle);
             }
         });
-        AudioCapture Capture;
-        const bool CaptureStarted = Capture.Run(SessionRunning, Queue, QueueEvent);
+        bool CaptureGaveUp = false;
+        std::uint32_t ConsecutiveFailures = 0;
+        while (SessionRunning.load(std::memory_order_acquire))
+        {
+            AudioCapture Capture;
+            const CaptureResult Result = Capture.Run(SessionRunning, Queue, QueueEvent);
+            if (Result == CaptureResult::Stopped)
+            {
+                break;
+            }
+            if (Result == CaptureResult::DeviceChanged)
+            {
+                ConsecutiveFailures = 0;
+                continue;
+            }
+            if (++ConsecutiveFailures >= CaptureRetryLimit)
+            {
+                CaptureGaveUp = true;
+                break;
+            }
+            std::this_thread::sleep_for(CaptureRetryInterval);
+        }
         SessionRunning.store(false, std::memory_order_release);
         SetEvent(QueueEvent);
         Link.CancelTransfers();
@@ -219,7 +241,7 @@ int wmain(int ArgumentCount, wchar_t** Arguments)
         }
         Link.Close();
         CloseHandle(QueueEvent);
-        if (!CaptureStarted)
+        if (CaptureGaveUp)
         {
             return 1;
         }

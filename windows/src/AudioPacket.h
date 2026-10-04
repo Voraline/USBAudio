@@ -9,7 +9,11 @@
 
 inline constexpr std::size_t AudioQueueCapacity = 64;
 
-using AudioPacket = std::array<std::int16_t, UsbAudio::AudioFrameSamples>;
+struct AudioPacket
+{
+    std::uint16_t Count = 0;
+    std::array<std::int16_t, UsbAudio::MaxPacketSamples> Samples{};
+};
 
 template <typename T, std::size_t Capacity>
 class SpscQueue

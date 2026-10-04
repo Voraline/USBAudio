@@ -377,69 +377,87 @@ bool UsbAccessoryLink::SelectBulkPipes()
     }
     ULONG TimeoutMs = 350;
     WinUsb_SetPipePolicy(InterfaceHandle, InPipe, PIPE_TRANSFER_TIMEOUT, sizeof(TimeoutMs), &TimeoutMs);
+    UCHAR ShortPacketTerminate = TRUE;
+    WinUsb_SetPipePolicy(InterfaceHandle, OutPipe, SHORT_PACKET_TERMINATE, sizeof(ShortPacketTerminate), &ShortPacketTerminate);
     UCHAR AutoSuspend = FALSE;
     WinUsb_SetPowerPolicy(InterfaceHandle, AUTO_SUSPEND, sizeof(AutoSuspend), &AutoSuspend);
-    if (WriteEvent == nullptr)
-    {
-        WriteEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    }
-    return WriteEvent != nullptr;
+    return CreateWriteSlots();
 }
 
-bool UsbAccessoryLink::CompletePendingWrite(DWORD TimeoutMilliseconds)
+bool UsbAccessoryLink::CreateWriteSlots()
 {
-    if (!WritePending)
+    for (WriteSlot& Slot : WriteSlots)
+    {
+        if (Slot.Event == nullptr)
+        {
+            Slot.Event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (Slot.Event == nullptr)
+            {
+                return false;
+            }
+        }
+        Slot.Pending = false;
+    }
+    NextWriteSlot = 0;
+    return true;
+}
+
+bool UsbAccessoryLink::CompleteWrite(WriteSlot& Slot, DWORD TimeoutMilliseconds)
+{
+    if (!Slot.Pending)
     {
         return true;
     }
-    const DWORD WaitResult = WaitForSingleObject(WriteEvent, TimeoutMilliseconds);
+    const DWORD WaitResult = WaitForSingleObject(Slot.Event, TimeoutMilliseconds);
     if (WaitResult != WAIT_OBJECT_0)
     {
         WinUsb_AbortPipe(InterfaceHandle, OutPipe);
-        WritePending = false;
+        ULONG Discarded = 0;
+        WinUsb_GetOverlappedResult(InterfaceHandle, &Slot.Overlapped, &Discarded, TRUE);
+        Slot.Pending = false;
         return false;
     }
     ULONG Transferred = 0;
-    const bool Overlapped = WinUsb_GetOverlappedResult(InterfaceHandle, &WriteOverlapped, &Transferred, FALSE) != FALSE;
-    WritePending = false;
-    return Overlapped && Transferred == PendingWriteSize;
+    const bool Completed = WinUsb_GetOverlappedResult(InterfaceHandle, &Slot.Overlapped, &Transferred, FALSE) != FALSE;
+    Slot.Pending = false;
+    return Completed && Transferred == Slot.Size;
 }
 
 bool UsbAccessoryLink::WriteBytes(const std::uint8_t* Data, std::size_t Size)
 {
-    if (!CompletePendingWrite(PipeTimeoutMs))
+    WriteSlot& Slot = WriteSlots[NextWriteSlot];
+    if (Size > Slot.Buffer.size() || !CompleteWrite(Slot, PipeTimeoutMs))
     {
         return false;
     }
-    if (Size > WriteBuffer.size())
-    {
-        return false;
-    }
-    std::memcpy(WriteBuffer.data(), Data, Size);
-    WriteOverlapped = {};
-    WriteOverlapped.hEvent = WriteEvent;
+    std::memcpy(Slot.Buffer.data(), Data, Size);
+    Slot.Overlapped = {};
+    Slot.Overlapped.hEvent = Slot.Event;
+    Slot.Size = static_cast<ULONG>(Size);
     ULONG Transferred = 0;
-    const ULONG Requested = static_cast<ULONG>(Size);
-    if (WinUsb_WritePipe(InterfaceHandle, OutPipe, WriteBuffer.data(), Requested, &Transferred, &WriteOverlapped))
+    if (!WinUsb_WritePipe(InterfaceHandle, OutPipe, Slot.Buffer.data(), Slot.Size, &Transferred, &Slot.Overlapped))
     {
-        return true;
+        if (GetLastError() != ERROR_IO_PENDING)
+        {
+            return false;
+        }
+        Slot.Pending = true;
     }
-    if (GetLastError() != ERROR_IO_PENDING)
-    {
-        return false;
-    }
-    WritePending = true;
-    PendingWriteSize = Requested;
+    NextWriteSlot = (NextWriteSlot + 1) % WriteSlots.size();
     return true;
 }
 
-bool UsbAccessoryLink::WriteAudio(const std::int16_t* Samples)
+bool UsbAccessoryLink::WriteAudio(const std::int16_t* Samples, std::size_t Count)
 {
     if (InterfaceHandle == nullptr || Samples == nullptr)
     {
         return false;
     }
-    return WriteBytes(reinterpret_cast<const std::uint8_t*>(Samples), UsbAudio::AudioFrameSamples * sizeof(*Samples));
+    if (Count == 0)
+    {
+        return true;
+    }
+    return WriteBytes(reinterpret_cast<const std::uint8_t*>(Samples), Count * sizeof(*Samples));
 }
 
 void UsbAccessoryLink::CancelTransfers()
@@ -462,24 +480,32 @@ void UsbAccessoryLink::Close()
     if (InterfaceHandle != nullptr)
     {
         CancelTransfers();
-        if (WritePending)
+        for (WriteSlot& Slot : WriteSlots)
         {
-            ULONG Transferred = 0;
-            WinUsb_GetOverlappedResult(InterfaceHandle, &WriteOverlapped, &Transferred, TRUE);
+            if (Slot.Pending)
+            {
+                ULONG Transferred = 0;
+                WinUsb_GetOverlappedResult(InterfaceHandle, &Slot.Overlapped, &Transferred, TRUE);
+                Slot.Pending = false;
+            }
         }
         WinUsb_Free(InterfaceHandle);
         InterfaceHandle = nullptr;
     }
-    WritePending = false;
+    for (WriteSlot& Slot : WriteSlots)
+    {
+        Slot.Pending = false;
+        if (Slot.Event != nullptr)
+        {
+            CloseHandle(Slot.Event);
+            Slot.Event = nullptr;
+        }
+    }
+    NextWriteSlot = 0;
     if (DeviceHandle != INVALID_HANDLE_VALUE)
     {
         CloseHandle(DeviceHandle);
         DeviceHandle = INVALID_HANDLE_VALUE;
-    }
-    if (WriteEvent != nullptr)
-    {
-        CloseHandle(WriteEvent);
-        WriteEvent = nullptr;
     }
     OutPipe = 0;
     InPipe = 0;

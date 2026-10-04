@@ -17,6 +17,7 @@ check_ipo_supported(RESULT UsbAudioIPOSupported LANGUAGES CXX)
 add_executable(UsbAudioSender
     windows/src/Main.cpp
     windows/src/AudioCapture.cpp
+    windows/src/DefaultDeviceWatcher.cpp
     windows/src/LowLatencyRender.cpp
     windows/src/UsbAccessory.cpp
 )
