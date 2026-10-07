@@ -7,11 +7,11 @@ class TpdfDither
 public:
     float Next()
     {
-        return NextUniform(StateA) + NextUniform(StateB);
+        return NextUniform() + NextUniform();
     }
 
 private:
-    static float NextUniform(std::uint32_t& State)
+    float NextUniform()
     {
         State ^= State << 13;
         State ^= State >> 17;
@@ -19,6 +19,5 @@ private:
         return static_cast<float>(State >> 8) * (1.0f / 16777216.0f) - 0.5f;
     }
 
-    std::uint32_t StateA = 0x9E3779B9u;
-    std::uint32_t StateB = 0x6C62272Eu;
+    std::uint32_t State = 0x9E3779B9u;
 };

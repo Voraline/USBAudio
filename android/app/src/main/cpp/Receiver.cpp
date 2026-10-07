@@ -151,15 +151,11 @@ public:
         const std::array<float, Taps>& Lower = Table[Row];
         const std::array<float, Taps>& Upper = Table[Row + 1];
         const std::uint64_t First = Base - HistoryFrames;
-        float Gathered[Taps];
-        for (std::size_t Tap = 0; Tap < Taps; ++Tap)
-        {
-            Gathered[Tap] = static_cast<float>(Ring.GetSample(First + Tap));
-        }
         float Sum = 0.0f;
         for (std::size_t Tap = 0; Tap < Taps; ++Tap)
         {
-            Sum += (Lower[Tap] + (Upper[Tap] - Lower[Tap]) * Blend) * Gathered[Tap];
+            const float Weight = Lower[Tap] + (Upper[Tap] - Lower[Tap]) * Blend;
+            Sum += Weight * static_cast<float>(Ring.GetSample(First + Tap));
         }
         return Sum;
     }
@@ -328,13 +324,6 @@ private:
             Resyncs.fetch_add(1, std::memory_order_relaxed);
         }
         UpdateController(Queued - TargetFrames, static_cast<double>(NumFrames) / SampleRateFrames);
-
-        const std::uint64_t RebaseAnchor = WriteFrame > RebaseWindowFrames ? WriteFrame - RebaseWindowFrames : 0;
-        if (Position > static_cast<double>(RebaseAnchor) + RebaseThresholdFrames)
-        {
-            const double Fractional = Position - std::floor(Position);
-            Position = static_cast<double>(RebaseAnchor) + Fractional;
-        }
 
         const double Step = 1.0 + Adjustment;
         std::int32_t Frame = 0;
@@ -575,8 +564,6 @@ private:
     static constexpr double ProportionalGain = 1.25e-5;
     static constexpr double IntegralGain = 1.875e-6;
     static constexpr double MaximumAdjustment = 0.002;
-    static constexpr std::uint64_t RebaseWindowFrames = 65536;
-    static constexpr double RebaseThresholdFrames = 1073741824.0;
     static_assert(UsbAudio::MaxPacketSamples * sizeof(std::int16_t) <= ReadRequestBytes);
     static_assert(MinimumTargetFrames > static_cast<double>(InterpolationFilter::LookaheadFrames));
     static_assert(MaximumTargetFrames + ResyncHighWaterFrames + static_cast<double>(InterpolationFilter::Taps) < static_cast<double>(PcmRing::CapacityFrames));

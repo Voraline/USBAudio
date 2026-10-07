@@ -11,7 +11,6 @@ target_link_libraries(usb_audio_native PRIVATE aaudio log android)
 target_compile_options(usb_audio_native PRIVATE
     -Wall -Wextra -Werror=return-type
     -fno-exceptions -fno-rtti
-    -ffp-contract=fast
     -ffunction-sections -fdata-sections
     $<$<CONFIG:Release>:-O3>
 )
