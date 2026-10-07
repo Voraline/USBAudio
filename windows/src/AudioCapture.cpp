@@ -15,6 +15,15 @@
 #include <mmdeviceapi.h>
 #include <windows.h>
 
+namespace
+{
+    const GUID& GetIeeeFloatSubtype()
+    {
+        static const GUID IeeeFloat = {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+        return IeeeFloat;
+    }
+}
+
 #include "DefaultDeviceWatcher.h"
 #include "LowLatencyRender.h"
 
@@ -63,7 +72,7 @@ namespace
         if (Format->wFormatTag == WAVE_FORMAT_EXTENSIBLE && Format->cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX))
         {
             const auto* Extended = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(Format);
-            return IsEqualGUID(Extended->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) != 0;
+            return IsEqualGUID(Extended->SubFormat, GetIeeeFloatSubtype()) != 0;
         }
         return false;
     }
@@ -219,6 +228,8 @@ CaptureResult AudioCapture::Run(std::atomic<bool>& Running, SpscQueue<AudioPacke
         return CaptureResult::Failed;
     }
     Format.UseAvx2 = Format.IsFloat && Format.Bits == 32 && Format.Channels == 2 && Format.BlockAlign == 8;
+    ResampleStep = static_cast<double>(Format.SampleRate) / static_cast<double>(UsbAudio::SampleRate);
+    Resampler.Reset();
 
     std::wcout << (LowLatency.Open(Device, MixFormat) ? L"Capture mode: low latency\n" : L"Capture mode: default\n");
     AudioEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -321,28 +332,54 @@ HRESULT AudioCapture::DrainPackets(IAudioCaptureClient* Capture, std::atomic<boo
     return Result;
 }
 
+void AudioCapture::PushSilentPacket(SpscQueue<AudioPacket, AudioQueueCapacity>& Queue)
+{
+    AudioPacket Silent{};
+    Silent.Count = static_cast<std::uint16_t>(Silent.Samples.size());
+    if (Queue.Push(Silent) && QueueEvent != nullptr)
+    {
+        SetEvent(QueueEvent);
+    }
+}
+
 void AudioCapture::ConvertBuffer(const std::uint8_t* Data, UINT32 Frames, DWORD Flags, SpscQueue<AudioPacket, AudioQueueCapacity>& Queue)
 {
     const bool Silent = (Flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+    if (Silent)
+    {
+        UINT32 Remaining = Frames;
+        while (Remaining > 0)
+        {
+            const UINT32 Space = static_cast<UINT32>(Packet.Samples.size()) - Packet.Count;
+            if (Remaining >= Space)
+            {
+                std::memset(Packet.Samples.data() + Packet.Count, 0, Space * sizeof(std::int16_t));
+                Packet.Count = static_cast<std::uint16_t>(Packet.Samples.size());
+                FlushPacket(Queue);
+                Remaining -= Space;
+            }
+            else
+            {
+                std::memset(Packet.Samples.data() + Packet.Count, 0, Remaining * sizeof(std::int16_t));
+                Packet.Count += static_cast<std::uint16_t>(Remaining);
+                Remaining = 0;
+            }
+        }
+        return;
+    }
+
     UINT32 FramesDone = 0;
     while (FramesDone < Frames)
     {
         const UINT32 ChunkFrames = std::min<UINT32>(Frames - FramesDone, static_cast<UINT32>(MonoScratch.size()));
-        if (Silent)
+        const std::uint8_t* ChunkBytes = Data + static_cast<std::size_t>(FramesDone) * Format.BlockAlign;
+        if (Format.UseAvx2)
         {
-            std::fill_n(MonoScratch.begin(), ChunkFrames, 0.0f);
+            DownmixMonoFloat32Stereo(ChunkBytes, ChunkFrames, MonoScratch.data());
         }
         else
         {
-            const std::uint8_t* ChunkBytes = Data + static_cast<std::size_t>(FramesDone) * Format.BlockAlign;
-            if (Format.UseAvx2)
-            {
-                DownmixMonoFloat32Stereo(ChunkBytes, ChunkFrames, MonoScratch.data());
-            }
-            else
-            {
-                DownmixMonoScalar(ChunkBytes, ChunkFrames, Format.BlockAlign, Format.Bits, Format.IsFloat, Format.Channels, MonoScratch.data());
-            }
+            DownmixMonoScalar(ChunkBytes, ChunkFrames, Format.BlockAlign, Format.Bits, Format.IsFloat, Format.Channels, MonoScratch.data());
         }
         for (UINT32 Frame = 0; Frame < ChunkFrames; ++Frame)
         {
@@ -359,23 +396,10 @@ void AudioCapture::ConvertFrame(float Mono, SpscQueue<AudioPacket, AudioQueueCap
         AppendSample(ToPcm16(Mono), Queue);
         return;
     }
-    const double Step = static_cast<double>(Format.SampleRate) / UsbAudio::SampleRate;
-    if (!HasPrevious)
+    Resampler.Push(Mono, ResampleStep, [&](float Sample)
     {
-        PreviousSample = Mono;
-        HasPrevious = true;
-        AppendSample(ToPcm16(Mono), Queue);
-        ResamplePhase = Step;
-        return;
-    }
-    while (ResamplePhase <= 1.0)
-    {
-        const float Ratio = static_cast<float>(std::clamp(ResamplePhase, 0.0, 1.0));
-        AppendSample(ToPcm16(PreviousSample + (Mono - PreviousSample) * Ratio), Queue);
-        ResamplePhase += Step;
-    }
-    ResamplePhase -= 1.0;
-    PreviousSample = Mono;
+        AppendSample(ToPcm16(Sample), Queue);
+    });
 }
 
 void AudioCapture::AppendSample(std::int16_t Sample, SpscQueue<AudioPacket, AudioQueueCapacity>& Queue)

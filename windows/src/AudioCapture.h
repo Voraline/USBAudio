@@ -8,6 +8,7 @@
 #include <audioclient.h>
 
 #include "AudioPacket.h"
+#include "PolyphaseResampler.h"
 #include "TpdfDither.h"
 
 enum class CaptureResult
@@ -38,6 +39,7 @@ private:
     void ConvertFrame(float Mono, SpscQueue<AudioPacket, AudioQueueCapacity>& Queue);
     void AppendSample(std::int16_t Sample, SpscQueue<AudioPacket, AudioQueueCapacity>& Queue);
     void FlushPacket(SpscQueue<AudioPacket, AudioQueueCapacity>& Queue);
+    void PushSilentPacket(SpscQueue<AudioPacket, AudioQueueCapacity>& Queue);
     std::int16_t ToPcm16(float Value);
 
     static constexpr std::size_t MonoScratchCapacity = 4096;
@@ -48,9 +50,8 @@ private:
     SourceFormat Format;
     AudioPacket Packet{};
     TpdfDither Dither;
-    double ResamplePhase = 0.0;
-    float PreviousSample = 0.0f;
-    bool HasPrevious = false;
+    PolyphaseResampler Resampler;
+    double ResampleStep = 1.0;
     HANDLE QueueEvent = nullptr;
     std::array<float, MonoScratchCapacity> MonoScratch{};
 };

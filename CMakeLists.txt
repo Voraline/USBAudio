@@ -24,11 +24,12 @@ add_executable(UsbAudioSender
 
 target_compile_features(UsbAudioSender PRIVATE cxx_std_20)
 target_include_directories(UsbAudioSender PRIVATE shared windows/src)
+target_sources(UsbAudioSender PRIVATE windows/src/PolyphaseResampler.h)
 target_link_libraries(UsbAudioSender PRIVATE ole32 uuid avrt setupapi winusb advapi32)
 target_compile_definitions(UsbAudioSender PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 if(MSVC)
     target_compile_options(UsbAudioSender PRIVATE
-        /W4 /EHsc /arch:AVX2 /MP /fp:precise /Gy
+        /W4 /EHsc /arch:AVX2 /MP /fp:precise /fp:contract /Gy
         $<$<CONFIG:Release,RelWithDebInfo>:/Gw>
         $<$<CONFIG:Release,RelWithDebInfo>:/Zc:inline>
     )
@@ -41,4 +42,7 @@ if(MSVC)
         set_property(TARGET UsbAudioSender PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
         set_property(TARGET UsbAudioSender PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO TRUE)
     endif()
+elseif(MINGW)
+    target_compile_options(UsbAudioSender PRIVATE -O3 -mavx2 -mfma -ffp-contract=fast -Wall -Wextra)
+    target_link_options(UsbAudioSender PRIVATE -municode -static -static-libgcc -static-libstdc++ -s)
 endif()
