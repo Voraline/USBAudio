@@ -4,11 +4,22 @@
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include <windows.h>
 #include <winusb.h>
 
 #include "AudioFormat.h"
+
+struct UsbDeviceId
+{
+    std::uint16_t VendorId = 0;
+    std::uint16_t ProductId = 0;
+
+    bool operator==(const UsbDeviceId&) const = default;
+};
+
+std::vector<UsbDeviceId> FindUsbDeviceIds();
 
 class UsbAccessoryLink
 {

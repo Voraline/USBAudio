@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -17,7 +18,8 @@ namespace
 {
     std::atomic<bool> AppRunning{true};
     std::atomic<bool> SessionRunning{false};
-    constexpr std::chrono::milliseconds CandidateProbeInterval{250};
+    constexpr std::chrono::milliseconds ReconnectInterval{250};
+    constexpr std::chrono::milliseconds RejectedRetryInterval{3000};
     constexpr std::chrono::milliseconds CaptureRetryInterval{500};
     constexpr std::uint32_t CaptureRetryLimit = 10;
 
@@ -42,39 +44,64 @@ namespace
         SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &Throttling, sizeof(Throttling));
     }
 
-    bool ParseId(const std::wstring& Value, std::uint16_t& Result)
+    struct AutoConnectState
     {
-        wchar_t* End = nullptr;
-        const unsigned long Parsed = std::wcstoul(Value.c_str(), &End, 16);
-        if (Value.empty() || End == nullptr || *End != L'\0' || Parsed > 0xFFFF)
-        {
-            return false;
-        }
-        Result = static_cast<std::uint16_t>(Parsed);
-        return true;
+        std::vector<UsbDeviceId> Present;
+        std::vector<UsbDeviceId> Rejected;
+        UsbDeviceId Preferred{};
+        bool HasPreferred = false;
+        std::chrono::steady_clock::time_point RejectedSince = std::chrono::steady_clock::now();
+    };
+
+    std::int64_t RemainingMilliseconds(std::chrono::steady_clock::time_point Deadline)
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(Deadline - std::chrono::steady_clock::now()).count();
     }
 
-    bool TryConnectCandidate(UsbAccessoryLink& Link, std::atomic<bool>& Running, std::uint16_t VendorId, std::uint16_t ProductId, std::uint32_t TimeoutMilliseconds)
+    bool TryAutoConnect(UsbAccessoryLink& Link, std::atomic<bool>& Running, AutoConnectState& State, std::uint32_t TimeoutMilliseconds)
     {
-        const auto Deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(TimeoutMilliseconds);
-        while (Running.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < Deadline)
+        std::vector<UsbDeviceId> Present = FindUsbDeviceIds();
+        const auto Now = std::chrono::steady_clock::now();
+        if (Present != State.Present || Now - State.RejectedSince >= RejectedRetryInterval)
         {
-            if (Link.TryOpenAccessory())
+            State.Present = Present;
+            State.Rejected.clear();
+            State.RejectedSince = Now;
+        }
+        if (State.HasPreferred)
+        {
+            const auto PreferredIterator = std::find(Present.begin(), Present.end(), State.Preferred);
+            if (PreferredIterator != Present.end())
             {
-                const auto Remaining = std::chrono::duration_cast<std::chrono::milliseconds>(Deadline - std::chrono::steady_clock::now()).count();
-                return Remaining > 0 && Link.WaitForReceiver(Running, static_cast<std::uint32_t>(Remaining));
+                std::rotate(Present.begin(), PreferredIterator, PreferredIterator + 1);
             }
-            if (Link.EnterAccessoryMode(VendorId, ProductId))
+        }
+
+        for (const UsbDeviceId& DeviceId : Present)
+        {
+            if (!Running.load(std::memory_order_acquire))
             {
-                const auto Remaining = std::chrono::duration_cast<std::chrono::milliseconds>(Deadline - std::chrono::steady_clock::now()).count();
-                if (Remaining <= 0 || !Link.WaitForAccessory(Running, static_cast<std::uint32_t>(Remaining)))
-                {
-                    return false;
-                }
-                const auto ReceiverRemaining = std::chrono::duration_cast<std::chrono::milliseconds>(Deadline - std::chrono::steady_clock::now()).count();
-                return ReceiverRemaining > 0 && Link.WaitForReceiver(Running, static_cast<std::uint32_t>(ReceiverRemaining));
+                return false;
             }
-            std::this_thread::sleep_for(CandidateProbeInterval);
+            if (std::find(State.Rejected.begin(), State.Rejected.end(), DeviceId) != State.Rejected.end())
+            {
+                continue;
+            }
+            if (!Link.EnterAccessoryMode(DeviceId.VendorId, DeviceId.ProductId))
+            {
+                State.Rejected.push_back(DeviceId);
+                continue;
+            }
+
+            State.Preferred = DeviceId;
+            State.HasPreferred = true;
+            const auto Deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(TimeoutMilliseconds);
+            if (!Link.WaitForAccessory(Running, TimeoutMilliseconds))
+            {
+                return false;
+            }
+            const std::int64_t Remaining = RemainingMilliseconds(Deadline);
+            return Remaining > 0 && Link.WaitForReceiver(Running, static_cast<std::uint32_t>(Remaining));
         }
         return false;
     }
@@ -84,61 +111,23 @@ int wmain(int ArgumentCount, wchar_t** Arguments)
 {
     SetConsoleCtrlHandler(ConsoleControl, TRUE);
     ConfigureProcessScheduling();
-    std::vector<std::uint16_t> VendorIds;
-    std::vector<std::uint16_t> ProductIds;
-    std::uint32_t CandidateTimeoutMilliseconds = 5000;
+    std::uint32_t ConnectTimeoutMilliseconds = 5000;
     for (int ArgumentIndex = 1; ArgumentIndex < ArgumentCount; ++ArgumentIndex)
     {
         const std::wstring Option = Arguments[ArgumentIndex];
-        if (Option == L"--timeout" && ArgumentIndex + 1 < ArgumentCount)
-        {
-            wchar_t* End = nullptr;
-            const unsigned long TimeoutSeconds = std::wcstoul(Arguments[++ArgumentIndex], &End, 10);
-            if (End == nullptr || *End != L'\0' || TimeoutSeconds == 0 || TimeoutSeconds > 300)
-            {
-                return 2;
-            }
-            CandidateTimeoutMilliseconds = static_cast<std::uint32_t>(TimeoutSeconds * 1000);
-            continue;
-        }
-        std::vector<std::uint16_t>* Values = nullptr;
-        if (Option == L"--vid")
-        {
-            Values = &VendorIds;
-        }
-        else if (Option == L"--pid")
-        {
-            Values = &ProductIds;
-        }
-        else
+        if (Option != L"--timeout" || ArgumentIndex + 1 >= ArgumentCount)
         {
             return 2;
         }
-
-        while (ArgumentIndex + 1 < ArgumentCount)
-        {
-            const std::wstring Value = Arguments[ArgumentIndex + 1];
-            if (Value.rfind(L"--", 0) == 0)
-            {
-                break;
-            }
-            std::uint16_t Id = 0;
-            if (!ParseId(Value, Id))
-            {
-                return 2;
-            }
-            Values->push_back(Id);
-            ++ArgumentIndex;
-        }
-        if (Values->empty())
+        wchar_t* End = nullptr;
+        const unsigned long TimeoutSeconds = std::wcstoul(Arguments[++ArgumentIndex], &End, 10);
+        if (End == nullptr || *End != L'\0' || TimeoutSeconds == 0 || TimeoutSeconds > 300)
         {
             return 2;
         }
+        ConnectTimeoutMilliseconds = static_cast<std::uint32_t>(TimeoutSeconds * 1000);
     }
-    if (VendorIds.size() != ProductIds.size())
-    {
-        return 2;
-    }
+    AutoConnectState AutoState;
 
     while (AppRunning.load(std::memory_order_acquire))
     {
@@ -148,13 +137,9 @@ int wmain(int ArgumentCount, wchar_t** Arguments)
         {
             Connected = Link.WaitForReceiver(AppRunning);
         }
-        else if (VendorIds.empty())
+        else
         {
-            return 1;
-        }
-        for (std::size_t CandidateIndex = 0; !Connected && CandidateIndex < VendorIds.size() && AppRunning.load(std::memory_order_acquire); ++CandidateIndex)
-        {
-            Connected = TryConnectCandidate(Link, AppRunning, VendorIds[CandidateIndex], ProductIds[CandidateIndex], CandidateTimeoutMilliseconds);
+            Connected = TryAutoConnect(Link, AppRunning, AutoState, ConnectTimeoutMilliseconds);
         }
         if (!Connected)
         {
@@ -163,7 +148,7 @@ int wmain(int ArgumentCount, wchar_t** Arguments)
             {
                 break;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            std::this_thread::sleep_for(ReconnectInterval);
             continue;
         }
 

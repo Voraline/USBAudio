@@ -3,7 +3,10 @@
 #include <array>
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <cwchar>
+#include <iterator>
 #include <cwctype>
 #include <thread>
 #include <vector>
@@ -137,6 +140,57 @@ namespace
         SetupDiDestroyDeviceInfoList(DeviceInfo);
         return InterfaceGuids;
     }
+}
+
+std::vector<UsbDeviceId> FindUsbDeviceIds()
+{
+    std::vector<UsbDeviceId> DeviceIds;
+    HDEVINFO DeviceInfo = SetupDiGetClassDevsW(nullptr, L"USB", nullptr, DIGCF_ALLCLASSES | DIGCF_PRESENT);
+    if (DeviceInfo == INVALID_HANDLE_VALUE)
+    {
+        return DeviceIds;
+    }
+
+    for (DWORD Index = 0;; ++Index)
+    {
+        SP_DEVINFO_DATA DeviceData{};
+        DeviceData.cbSize = sizeof(DeviceData);
+        if (!SetupDiEnumDeviceInfo(DeviceInfo, Index, &DeviceData))
+        {
+            break;
+        }
+
+        wchar_t InstanceId[256]{};
+        if (!SetupDiGetDeviceInstanceIdW(DeviceInfo, &DeviceData, InstanceId, static_cast<DWORD>(std::size(InstanceId)), nullptr))
+        {
+            continue;
+        }
+
+        unsigned int VendorId = 0;
+        unsigned int ProductId = 0;
+        if (swscanf_s(InstanceId, L"USB\\VID_%4x&PID_%4x", &VendorId, &ProductId) != 2)
+        {
+            continue;
+        }
+
+        const UsbDeviceId DeviceId{ static_cast<std::uint16_t>(VendorId), static_cast<std::uint16_t>(ProductId) };
+        if (DeviceId.VendorId == GoogleVendorId && (DeviceId.ProductId == AccessoryProductId || DeviceId.ProductId == AccessoryAdbProductId))
+        {
+            continue;
+        }
+        if (std::find(DeviceIds.begin(), DeviceIds.end(), DeviceId) != DeviceIds.end())
+        {
+            continue;
+        }
+        if (FindInterfaceGuids(DeviceId.VendorId, DeviceId.ProductId).empty())
+        {
+            continue;
+        }
+        DeviceIds.push_back(DeviceId);
+    }
+
+    SetupDiDestroyDeviceInfoList(DeviceInfo);
+    return DeviceIds;
 }
 
 UsbAccessoryLink::~UsbAccessoryLink()

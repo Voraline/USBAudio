@@ -30,13 +30,13 @@ cmake --build build/windows --config Release --parallel
 
 The executable is `build/windows/Release/UsbAudioSender.exe`.
 
-The sender accepts multiple vendor and product IDs. Pair values by position; it waits up to 5 seconds for each pair by default before trying the next. Set `--timeout N` to use a different per-pair timeout in seconds. Find the phone's normal-mode IDs in Device Manager under the connected phone interface's **Details > Hardware Ids**. For example:
+The sender finds the phone on its own. It scans the connected USB devices that already have a WinUSB binding, asks each one to enter accessory mode, and remembers the one that works so it is tried first after a reconnect. Run it with no arguments:
 
 ```powershell
-.\build\windows\Release\UsbAudioSender.exe --vid 18D1 2717 --pid 4EE7 FF88 --timeout 2
+.\build\windows\Release\UsbAudioSender.exe
 ```
 
-The sender tries `18D1:4EE7` first, then `2717:FF88`. The example gives each pair 2 seconds. Timeout values must be between 1 and 300 seconds. If the phone is already in accessory mode, the sender detects it without VID/PID arguments. Supplying normal-mode IDs allows the sender to request accessory mode and retry after disconnects. The only console output is printed when the USB audio link is ready.
+Use `--timeout N` to set how many seconds (1 to 300, default 5) it waits for the phone to switch to accessory mode and report ready. If the phone is already in accessory mode, the sender detects it directly. The only console output is printed when the USB audio link is ready.
 
 ## Build the Android release APK
 
@@ -66,4 +66,4 @@ The Android receiver reads whatever bytes arrive, carrying an odd trailing byte 
 
 The target fill is the larger of 240 frames and the AAudio callback size plus 128 frames. If the ring starves, output decays smoothly, the target grows by 32 frames up to 512 extra, and playback re-primes before resuming with a short fade-in. The buffer therefore settles at the smallest size the phone and USB path can sustain, and the extra target resets whenever the stream restarts. If the ring ever holds more than 960 frames above target, playback skips to the target with a 48-frame crossfade. Fill, target, controller adjustment in ppm, underruns, resyncs, and dropped chunks are written to logcat under the tag `UsbAudio` every 10 seconds and whenever an event counter changes.
 
-AAudio uses low-latency mode and requests at least one device burst, with a 192-frame minimum buffer. USB has ample throughput for this PCM rate. A disconnect stops the active stream cleanly; the Windows sender retries the USB accessory handshake when phone VID/PID arguments were provided.
+AAudio uses low-latency mode and requests at least one device burst, with a 192-frame minimum buffer. USB has ample throughput for this PCM rate. A disconnect stops the active stream cleanly; the Windows sender rescans and retries the USB accessory handshake automatically.
