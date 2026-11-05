@@ -50,7 +50,7 @@ cd android
 gradle --no-daemon assembleRelease
 ```
 
-The `preBuild` step runs `cargo ndk -t arm64-v8a ... build --release` in `rust/android` and places `libusb_audio_native.so` into `jniLibs`, which Gradle packages into the APK.
+The `preBuild` step runs `cargo ndk -t arm64-v8a -p 33 ... build --release` in `rust/android` and places `libusb_audio_native.so` into `jniLibs`, which Gradle packages into the APK. Platform 33 is passed explicitly because `libaaudio.so` only exists in the API 26+ NDK sysroot; cargo-ndk's default platform would fail to link it.
 
 The APK is `android/app/build/outputs/apk/release/app-release.apk`. The release build uses the Android debug signing configuration and does not need a custom signing key.
 
