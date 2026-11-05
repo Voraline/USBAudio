@@ -85,11 +85,11 @@ unsafe fn register_natives(
 /// `JNI_OnLoad` entry point, exported from libusb_audio_native.so.
 #[no_mangle]
 pub unsafe extern "C" fn JNI_OnLoad(vm: *mut c_void, _reserved: *mut c_void) -> jint {
-    let get_env: unsafe extern "C" fn(*mut c_void, *mut c_int, *mut *mut c_void) -> c_int =
+    // JNIInvokeInterface_::GetEnv(JavaVM* vm, void** penv, jint version).
+    let get_env: unsafe extern "C" fn(*mut c_void, *mut *mut c_void, c_int) -> c_int =
         std::mem::transmute(*table_of(vm).add(6));
     let mut environment: *mut c_void = std::ptr::null_mut();
-    let mut version = JNI_VERSION_1_6;
-    if get_env(vm, &mut version, &mut environment) != JNI_OK {
+    if get_env(vm, &mut environment, JNI_VERSION_1_6) != JNI_OK {
         return JNI_ERR;
     }
     let service_class =
