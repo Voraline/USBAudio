@@ -37,7 +37,7 @@ tasks.register("cargoNdkBuild", Exec) {
     workingDir file("../../rust/android")
     commandLine "cargo", "ndk",
         "-t", "arm64-v8a",
-        "-p", "33",
+        "--platform", "33",
         "-o", file("src/main/jniLibs").absolutePath,
         "build", "--release"
 }
