@@ -27,7 +27,7 @@ impl LowLatencyRender {
         }
     }
 
-    pub fn open(&mut self, device: &IMMDevice, format: &WAVEFORMATEX) -> bool {
+    pub fn open(&mut self, device: &IMMDevice, format: *const WAVEFORMATEX) -> bool {
         self.close();
         let mut default_period = 0u32;
         let mut fundamental_period = 0u32;

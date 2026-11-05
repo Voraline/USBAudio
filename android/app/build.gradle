@@ -34,7 +34,7 @@ android {
 // libaaudio.so only exists in the API 26+ sysroot; cargo-ndk's default
 // platform is lower and would fail to link -laaudio.
 tasks.register("cargoNdkBuild", Exec) {
-    workingDir file("../../rust/android")
+    workingDir file("..")
     commandLine "cargo", "ndk",
         "-t", "arm64-v8a",
         "--platform", "33",

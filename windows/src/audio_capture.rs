@@ -76,24 +76,39 @@ fn read_sample(data: &[u8], bits: u16, is_float: bool) -> f32 {
     0.0
 }
 
-fn is_float_format(format: &WAVEFORMATEX) -> bool {
-    if format.wFormatTag == WAVE_FORMAT_IEEE_FLOAT {
-        return true;
+fn is_float_format(format: *const WAVEFORMATEX) -> bool {
+    // SAFETY: GetMixFormat returns a buffer of at least
+    // sizeof(WAVEFORMATEX) + cbSize bytes.
+    unsafe {
+        if (*format).wFormatTag == WAVE_FORMAT_IEEE_FLOAT {
+            return true;
+        }
+        if (*format).wFormatTag == WAVE_FORMAT_EXTENSIBLE
+            && (*format).cbSize
+                >= (std::mem::size_of::<WAVEFORMATEXTENSIBLE>() - std::mem::size_of::<WAVEFORMATEX>())
+                    as u16
+        {
+            let sub_format = std::ptr::addr_of!((*(format as *const WAVEFORMATEXTENSIBLE)).SubFormat)
+                .read_unaligned();
+            return sub_format == IEEE_FLOAT_SUBFORMAT;
+        }
+        false
     }
-    if format.wFormatTag == WAVE_FORMAT_EXTENSIBLE
-        && format.cbSize
-            >= (std::mem::size_of::<WAVEFORMATEXTENSIBLE>() - std::mem::size_of::<WAVEFORMATEX>())
-                as u16
-    {
-        // SAFETY: cbSize guarantees the extensible fields are present. The
-        // struct is packed, so the field is read unaligned.
-        let sub_format = unsafe {
-            std::ptr::addr_of!((*(format as *const WAVEFORMATEX as *const WAVEFORMATEXTENSIBLE)).SubFormat)
-                .read_unaligned()
-        };
-        return sub_format == IEEE_FLOAT_SUBFORMAT;
+}
+
+/// Owns the CoTaskMem-allocated mix format for the lifetime of the capture
+/// session; WASAPI reads the full WAVEFORMATEX + cbSize bytes, so the
+/// allocation must outlive every API call that receives the pointer.
+struct MixFormatPtr(*mut WAVEFORMATEX);
+
+impl Drop for MixFormatPtr {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                CoTaskMemFree(Some(self.0 as *const core::ffi::c_void));
+            }
+        }
     }
-    false
 }
 
 fn downmix_mono_scalar(
@@ -147,6 +162,17 @@ impl AudioCapture {
             queue_event: HANDLE(null_mut()),
             mono_scratch: vec![0.0f32; MONO_SCRATCH_CAPACITY],
         }
+    }
+
+    /// Diagnostic accessor: (sample_rate, block_align, bits, channels, is_float).
+    pub fn source_format(&self) -> (u32, u32, u16, u16, bool) {
+        (
+            self.format.sample_rate,
+            self.format.block_align,
+            self.format.bits,
+            self.format.channels,
+            self.format.is_float,
+        )
     }
 
     pub fn run(
@@ -226,7 +252,7 @@ impl AudioCapture {
                     return CaptureResult::Failed;
                 }
             };
-        let mix_format_ptr = match unsafe { client.GetMixFormat() } {
+        let mix_format_ptr = MixFormatPtr(match unsafe { client.GetMixFormat() } {
             Ok(format) => format,
             Err(_) => {
                 if let Some(watcher) = &watcher {
@@ -234,11 +260,10 @@ impl AudioCapture {
                 }
                 return CaptureResult::Failed;
             }
-        };
-        let mix_format = unsafe { *mix_format_ptr };
-        unsafe {
-            CoTaskMemFree(Some(mix_format_ptr as *const core::ffi::c_void));
-        }
+        });
+        // The 18-byte prefix is copied for field access only; all API calls
+        // below receive the full allocation via the raw pointer.
+        let mix_format = unsafe { *mix_format_ptr.0 };
         if mix_format.nChannels == 0
             || mix_format.nSamplesPerSec == 0
             || mix_format.nBlockAlign == 0
@@ -253,7 +278,7 @@ impl AudioCapture {
             block_align: mix_format.nBlockAlign as u32,
             bits: mix_format.wBitsPerSample,
             channels: mix_format.nChannels,
-            is_float: is_float_format(&mix_format),
+            is_float: is_float_format(mix_format_ptr.0),
         };
         if (!self.format.is_float
             && self.format.bits != 16
@@ -268,7 +293,7 @@ impl AudioCapture {
         }
 
         let mut low_latency = LowLatencyRender::new();
-        if low_latency.open(&device, &mix_format) {
+        if low_latency.open(&device, mix_format_ptr.0) {
             println!("Capture mode: low latency");
         } else {
             println!("Capture mode: default");
@@ -286,22 +311,29 @@ impl AudioCapture {
         let capture: IAudioCaptureClient = {
             let mut capture: Option<IAudioCaptureClient> = None;
             unsafe {
-                if client
-                    .Initialize(
-                        AUDCLNT_SHAREMODE_SHARED,
-                        AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                        0,
-                        0,
-                        &mix_format,
-                        None,
-                    )
-                    .is_ok()
-                    && client.SetEventHandle(audio_event).is_ok()
-                {
-                    capture = client.GetService::<IAudioCaptureClient>().ok();
+                let initialize = client.Initialize(
+                    AUDCLNT_SHAREMODE_SHARED,
+                    AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                    0,
+                    0,
+                    mix_format_ptr.0,
+                    None,
+                );
+                if let Err(error) = initialize {
+                    eprintln!("Capture init: Initialize failed: {error}");
+                } else if let Err(error) = client.SetEventHandle(audio_event) {
+                    eprintln!("Capture init: SetEventHandle failed: {error}");
+                } else {
+                    match client.GetService::<IAudioCaptureClient>() {
+                        Ok(service) => capture = Some(service),
+                        Err(error) => eprintln!("Capture init: GetService failed: {error}"),
+                    }
                 }
-                if capture.is_some() && client.Start().is_err() {
-                    capture = None;
+                if capture.is_some() {
+                    if let Err(error) = client.Start() {
+                        eprintln!("Capture init: Start failed: {error}");
+                        capture = None;
+                    }
                 }
             }
             match capture {

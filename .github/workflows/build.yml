@@ -14,14 +14,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
       - name: Build Windows application
         run: cargo build --release -p usb-audio-sender
-        working-directory: rust
       - name: Upload Windows executable
         uses: actions/upload-artifact@v4
         with:
           name: windows-usb-audio
-          path: rust/target/release/UsbAudioSender.exe
+          path: target/release/UsbAudioSender.exe
           if-no-files-found: error
 
   android:
