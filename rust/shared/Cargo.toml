@@ -1,0 +1,4 @@
+[package]
+name = "usb-audio-shared"
+version.workspace = true
+edition.workspace = true

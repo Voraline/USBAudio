@@ -6,46 +6,51 @@ Audio travels over the USB accessory bulk endpoint. The project does not use Wi-
 
 ## Project layout
 
-- `windows/` contains the Windows WASAPI capture, PCM conversion, AOA negotiation, and WinUSB transport.
-- `android/` contains the accessory-mode Android app, JNI bridge, bounded PCM ring buffer, and AAudio playback.
-- `shared/AudioFormat.h` defines the PCM format and receiver-ready signal.
+- `rust/windows/` contains the Rust port of the Windows WASAPI capture, PCM conversion, AOA negotiation, and WinUSB transport (binary: `UsbAudioSender.exe`).
+- `rust/android/` contains the Rust port of the accessory-mode receiver: bounded PCM ring buffer, 16-tap windowed-sinc interpolation, PI rate control, AAudio playback, and the JNI bridge (library: `libusb_audio_native.so`).
+- `rust/shared/` defines the PCM format and receiver-ready signal shared by both crates.
+- `android/` contains the Android app (Java glue, manifest, accessory filter) that loads the Rust native library.
+- `shared/AudioFormat.h`, `windows/`, and `android/app/src/main/cpp/` are the original C++ implementation this Rust port matches exactly.
 - `.github/workflows/build.yml` builds the Windows executable and Android release APK on pushes and pull requests.
 
 ## Requirements
 
 The Android phone must support USB accessory mode, the `arm64-v8a` ABI, and Android 13 (API 33) or later. Use a USB data cable and approve the USB accessory prompt for USB Audio Receiver. Android playback runs in a foreground media service so streaming can continue when the activity is backgrounded.
 
-Windows needs an AVX2-capable x64 CPU, Visual Studio 2022 C++ build tools, and CMake 3.24 or later. The executable is compiled with AVX2 and will not run on CPUs without AVX2 support. Android builds need JDK 17, Gradle 8.9, Android SDK Platform 35, Android Build Tools 35.0.0, NDK 27.2.12479018, and CMake 3.22.1.
+Windows needs an x64 CPU and a stable Rust toolchain (`rustup`, MSVC toolchain).
 
 The Windows sender uses a WinUSB driver already bound by Windows to the phone's normal USB interface and Android accessory interface. It discovers the registered interface GUIDs automatically and does not install a driver. Windows can bind its built-in WinUSB driver without a separate package only when the USB device firmware advertises the required Microsoft OS descriptors. Android Open Accessory does not guarantee those descriptors, so phones without an existing compatible driver binding cannot be used by this Windows application through AOA alone. Installing a signed driver package or changing the phone firmware would be required to support those devices. AOA's optional standard USB audio mode sends audio from the Android device to its accessory, so it cannot replace the bulk-data path used here.
 
 ## Build the Windows app
 
-Run these commands in a Visual Studio 2022 x64 Native Tools PowerShell prompt from the repository root:
+From the repository root:
 
 ```powershell
-cmake -S . -B build/windows -A x64 -DCMAKE_BUILD_TYPE=Release
-cmake --build build/windows --config Release --parallel
+cargo build --release -p usb-audio-sender --manifest-path rust/Cargo.toml
 ```
 
-The executable is `build/windows/Release/UsbAudioSender.exe`.
+The executable is `rust/target/release/UsbAudioSender.exe`.
 
 The sender finds the phone on its own. It scans the connected USB devices that already have a WinUSB binding, asks each one to enter accessory mode, and remembers the one that works so it is tried first after a reconnect. Run it with no arguments:
 
 ```powershell
-.\build\windows\Release\UsbAudioSender.exe
+.\rust\target\release\UsbAudioSender.exe
 ```
 
 Use `--timeout N` to set how many seconds (1 to 300, default 5) it waits for the phone to switch to accessory mode and report ready. If the phone is already in accessory mode, the sender detects it directly. The only console output is printed when the USB audio link is ready.
 
 ## Build the Android release APK
 
-From the repository root, after installing the Android build requirements:
+Requirements: JDK 17, Gradle 8.9, Android SDK Platform 35, Android Build Tools 35.0.0, NDK 27.2.12479018, a stable Rust toolchain with the `aarch64-linux-android` target, and `cargo-ndk` (`cargo install cargo-ndk`). Point `cargo-ndk` at the NDK via `ANDROID_NDK_HOME` (or `ANDROID_HOME`/`ANDROID_SDK_ROOT`).
+
+From the repository root:
 
 ```powershell
 cd android
 gradle --no-daemon assembleRelease
 ```
+
+The `preBuild` step runs `cargo ndk -t arm64-v8a ... build --release` in `rust/android` and places `libusb_audio_native.so` into `jniLibs`, which Gradle packages into the APK.
 
 The APK is `android/app/build/outputs/apk/release/app-release.apk`. The release build uses the Android debug signing configuration and does not need a custom signing key.
 

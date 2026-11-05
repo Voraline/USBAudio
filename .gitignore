@@ -1,4 +1,6 @@
 build/
+rust/target/
 android/.gradle/
 android/local.properties
 android/app/build/
+android/app/src/main/jniLibs/

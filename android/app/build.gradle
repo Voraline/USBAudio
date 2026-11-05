@@ -25,11 +25,20 @@ android {
             proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
         }
     }
+}
 
-    externalNativeBuild {
-        cmake {
-            path file("src/main/cpp/CMakeLists.txt")
-            version "3.22.1"
-        }
-    }
+// Builds libusb_audio_native.so with cargo-ndk (Rust) and places it in
+// jniLibs, where AGP packages it into the APK. Requires Rust and cargo-ndk
+// (cargo install cargo-ndk) and the Android NDK visible to cargo-ndk via
+// ANDROID_NDK_HOME (or ANDROID_HOME/ANDROID_SDK_ROOT).
+tasks.register("cargoNdkBuild", Exec) {
+    workingDir file("../../rust/android")
+    commandLine "cargo", "ndk",
+        "-t", "arm64-v8a",
+        "-o", file("src/main/jniLibs").absolutePath,
+        "build", "--release"
+}
+
+tasks.named("preBuild") {
+    dependsOn "cargoNdkBuild"
 }

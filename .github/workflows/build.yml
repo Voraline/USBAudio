@@ -13,15 +13,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Configure Windows application
-        run: cmake -S . -B build/windows -A x64 -DCMAKE_BUILD_TYPE=Release
+      - uses: dtolnay/rust-toolchain@stable
       - name: Build Windows application
-        run: cmake --build build/windows --config Release --parallel
+        run: cargo build --release -p usb-audio-sender
+        working-directory: rust
       - name: Upload Windows executable
         uses: actions/upload-artifact@v4
         with:
           name: windows-usb-audio
-          path: build/windows/Release/UsbAudioSender.exe
+          path: rust/target/release/UsbAudioSender.exe
           if-no-files-found: error
 
   android:
@@ -39,11 +39,18 @@ jobs:
         with:
           packages: platform-tools
       - name: Install Android build dependencies
-        run: sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+        run: sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
       - name: Accept Android SDK licenses
         run: yes | sdkmanager --licenses
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
       - name: Build Android release APK
         run: gradle --no-daemon --project-dir android assembleRelease
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018
       - name: Upload Android release APK
         uses: actions/upload-artifact@v4
         with:

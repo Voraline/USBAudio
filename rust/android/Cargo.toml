@@ -1,0 +1,11 @@
+[package]
+name = "usb_audio_native"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+usb-audio-shared = { path = "../shared" }
+libc = "0.2"
