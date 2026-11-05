@@ -164,6 +164,17 @@ impl AudioCapture {
         }
     }
 
+    /// Diagnostic accessor: (sample_rate, block_align, bits, channels, is_float).
+    pub fn source_format(&self) -> (u32, u32, u16, u16, bool) {
+        (
+            self.format.sample_rate,
+            self.format.block_align,
+            self.format.bits,
+            self.format.channels,
+            self.format.is_float,
+        )
+    }
+
     pub fn run(
         &mut self,
         running: &AtomicBool,
